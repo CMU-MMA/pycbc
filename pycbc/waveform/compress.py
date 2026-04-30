@@ -274,7 +274,7 @@ def compress_waveform(htilde, sample_points, tolerance, interpolation,
     # waveform meets our mismatch target with the origianl waveform
     added_points = []
     iteration_count = 0
-    max_batch_size = 100
+    max_batch_size = 1000
 
     while mismatch > tolerance:
         iteration_start_time = time.time()
@@ -289,6 +289,8 @@ def compress_waveform(htilde, sample_points, tolerance, interpolation,
         # one (can be large numerical error in the veddiff calculation, so
         # rounding cause all to be below the tolerance yet thte full fails).
         num_select = min(max_batch_size, (num_bad // 4 + 1))
+        # Hueristic to add multiple points if size is already large
+        num_select = max(num_select, len(vecdiffs) // 50)
         selected_segments = vsort[:num_select]
 
         # --- 2. Propose new points ---
@@ -296,7 +298,7 @@ def compress_waveform(htilde, sample_points, tolerance, interpolation,
         for minpt in selected_segments:
             # Calculate midpoint using indices to avoid float drift issues
             add_freq = (sample_points[minpt] + sample_points[minpt+1]) / 2.0
-            addidx = int(add_freq / df)     
+            addidx = int(add_freq / df)
             if addidx not in sample_index and addidx not in new_addidxs:
                 new_addidxs.append(addidx)
 
