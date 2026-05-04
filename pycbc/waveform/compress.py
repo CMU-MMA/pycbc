@@ -624,7 +624,9 @@ def fd_decompress(amp, phase, sample_frequencies, out=None, df=None,
     else:
         # check for precision compatibility
         if out.precision == 'double' and precision == 'single':
-            raise ValueError("cannot cast single precision to double")
+            amp = amp.astype(numpy.float64)
+            phase = phase.astype(numpy.float64)
+            sample_frequencies = sample_frequencies.astype(numpy.float64)
         df = out.delta_f
         hlen = len(out)
     if f_lower is None:
