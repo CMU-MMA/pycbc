@@ -23,7 +23,7 @@ import numpy
 import logging
 import signal
 import tqdm
-import os
+import sys, os
 import argparse
 import numpy.random
 from scipy.stats import gaussian_kde
@@ -43,7 +43,7 @@ parser.add_argument('--output-file', required=True,
 parser.add_argument('--input-file', nargs='*', default=[],
     help='Bank to use as an initial set of starting samples.')
 parser.add_argument('--keep-entire-input-file', help="All of the templates in the input file will be kept in the output file, even if they do not pass normal mismatch criteria.", action='store_true')
-parser.add_argument('--input-config', required=True,
+parser.add_argument('--input-config',
     help='Draw parameters from the given configure file.')
 parser.add_argument('--minimal-match', default=0.97, type=float)
 parser.add_argument('--buffer-length', default=2, type=float,
@@ -86,6 +86,7 @@ args = parser.parse_args()
 pycbc.init_logging(args.verbose)
 numpy.random.seed(args.seed)
 
+validation_data = None  # Initialize to avoid NameError
 config_parser = pycbc.types.config.InterpolatingConfigParser()
 file = open(args.input_config, 'r')
 config_parser.read_file(file)
@@ -106,8 +107,7 @@ dists_joint = prior_from_config(cp=config_parser)
 
 def get_stable_match(p_inj, p_tmplt):
     """Iteratively doubles buffer length until the match stabilizes."""
-    frbl = args.full_resolution_buffer_length
-    current_buflen = args.buffer_length if frbl is None else frbl
+    current_buflen = args.buffer_length if args.full_resolution_buffer_length is None else args.full_resolution_buffer_length
     last_match = -1.0
     
     # We loop until convergence or a safety cap (e.g., 64s)
@@ -358,7 +358,7 @@ def handle_exit_signal(signum, frame):
     # Force exit so the script doesn't try to resume the loops
     os._exit(0)
 
-def save_bank(): # Use a local name
+def save_bank(val_data=None): # Use a local name
     logging.info("Saving current bank to %s", args.output_file)
     with HFile(args.output_file, 'w') as o:
         o.attrs['minimal_match'] = args.minimal_match
@@ -368,6 +368,12 @@ def save_bank(): # Use a local name
                 val = val.astype('bytes')
             o[k] = val
         o['max_matches'] = numpy.array(bank.max_matches)
+        
+        # Check the passed argument
+        if val_data:
+            v_grp = o.create_group('validation')
+            for k, v in val_data.items():
+                v_grp[k] = v
     logging.info("Save complete.")
 
 class GenUniformWaveform(object):
@@ -496,13 +502,34 @@ def wf_wrapper(args):
     except Exception as e:
         print(e)
         return None
+    
+def validation_worker(inj_params):
+    h_inj = gen.generate(**inj_params)
+    
+    best_m = -1.0
+    best_idx = -1
+    try:
+        # Independent brute-force search
+        for i, h_bank in enumerate(bank.waveforms):
+            # Match using local_gen's private IFFT/buffers
+            m = gen.match(h_inj, h_bank)
+            if m > best_m:
+                best_m = m
+                best_idx = i            
+
+            stable_ff, final_buflen = get_stable_match(inj_params, 
+                                               bank.waveforms[best_idx].params)
+    except Exception as e:
+        print(e)
+        raise(e)
+    return best_m, stable_ff, final_buflen
 
 if len(args.input_file) > 0:
     total_raw_templates = 0
     for input_file in args.input_file:
         logging.info("Loading: %s", input_file)
         with HFile(input_file, 'r') as f:
-            params = {k: f[k][:] for k in f.keys() if k not in ['max_matches']}
+            params = {k: f[k][:] for k in f.keys() if k not in ['max_matches', 'validation']}
             total_raw_templates += len(params[list(params.keys())[0]])
             bank, _ = bank.check_params(gen, params, args.minimal_match,
                                         force_add=args.keep_entire_input_file,
@@ -575,7 +602,7 @@ def cdraw(rtype, ts, te):
 
     if len(p[list(p.keys())[0]]) == 0:
         return None
-
+        
     return p
 
 signal.signal(signal.SIGINT, handle_exit_signal)
@@ -622,8 +649,7 @@ while tau0s < args.tau0_end:
             trail_matches = numpy.array(bank.max_matches[int(len(bank.max_matches)*0.9):])
             ave = numpy.mean(trail_matches)
             logging.info("%s: Round (K) (%s): %s Size: %s conv: %0.4f added: %s Trail Ave: %0.4f Trail Min: %0.4f",
-                         region, kloop, r, len(bank), kconv, len(bank) - blen,
-                         ave, trail_matches.min())
+                         region, kloop, r, len(bank), kconv, len(bank) - blen, ave, trail_matches.min())
 
 
             if uconv:
@@ -638,10 +664,40 @@ while tau0s < args.tau0_end:
                 break
 
     bank.culltau0(tau0s - args.tau0_threshold * 2.0)
-    logging.info("Region Done %3.1f-%3.1f, %s stored",
-                 tau0s, tau0e, bank.activelen())
+    logging.info("Region Done %3.1f-%3.1f, %s stored", tau0s, tau0e, bank.activelen())
     region += 1
     tau0s += args.tau0_crawl / 2
     tau0e += args.tau0_crawl / 2
 
 save_bank()
+#logging.info("Starting Final Validation Pass (10x density)...")
+#val_size = size * 10
+
+#samples = draw_samples_from_config(args.input_config, val_size, args.seed + 1)
+#val_params = {n: samples[n] for n in samples.fieldnames}
+#if static_args is not None:
+#    for k in static_args.keys():
+#        val_params[k] = numpy.array([static_args[k]]*val_size)
+
+#logging.info("Validating bank against %i injections using fork-shared waveforms", val_size)
+#3worker_inputs = [{k: val_params[k][i] for k in val_params}
+#                 for i in range(val_size)]
+
+#pool = pycbc.pool.choose_pool(args.nprocesses)
+#results = list(pool.imap_unordered(validation_worker, worker_inputs))
+#pool.close_pool()
+
+#decimated_ffs, stable_ffs, buflens = zip(*results)
+#stable_ffs = numpy.array(stable_ffs)
+#mean_ff = stable_ffs.mean()
+#holes = (stable_ffs < args.minimal_match).sum()
+#logging.info("Validation Pass Complete: Mean FF: %.4f, Holes Found: %d/%d", 
+#             mean_ff, holes, val_size)    
+
+#validation_data = {
+#    'decimated_ff': numpy.array(decimated_ffs),
+#    'stable_ff': numpy.array(stable_ffs),
+#    'final_buflen': numpy.array(buflens)
+#}
+
+#save_bank(validation_data)
