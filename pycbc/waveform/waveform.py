@@ -39,9 +39,9 @@ from pycbc.waveform import parameters
 from pycbc.conversions import get_final_from_initial, tau_from_final_mass_spin
 from pycbc.filter import interpolate_complex_frequency, resample_to_delta_t
 import pycbc
-from .spa_tmplt import spa_tmplt, spa_tmplt_norm, spa_tmplt_end, \
-                      spa_tmplt_precondition, spa_amplitude_factor, \
-                      spa_length_in_time
+from .spa_tmplt import spa_tmplt, spa_tmplt_tidal, spa_tmplt_norm, \
+                      spa_tmplt_end, spa_tmplt_precondition, \
+                      spa_amplitude_factor, spa_length_in_time
 
 class NoWaveformError(Exception):
     """This should be raised if generating a waveform would just result in all
@@ -1005,6 +1005,10 @@ _cuda_fd_filters['SPAtmplt'] = spa_tmplt
 _cupy_fd_filters['SPAtmplt'] = spa_tmplt
 _inspiral_fd_filters['SPAtmplt'] = spa_tmplt
 
+_cuda_fd_filters['SPAtmpltTidal'] = spa_tmplt_tidal
+_cupy_fd_filters['SPAtmpltTidal'] = spa_tmplt_tidal
+_inspiral_fd_filters['SPAtmpltTidal'] = spa_tmplt_tidal
+
 filter_wav = _scheme.ChooseBySchemeDict()
 filter_wav.update( {_scheme.CPUScheme:_inspiral_fd_filters,
                     _scheme.CUDAScheme:_cuda_fd_filters,
@@ -1083,7 +1087,11 @@ def get_hm_length_in_time(lor_approx, maxm_default, **kwargs):
 _filter_norms["SPAtmplt"] = spa_tmplt_norm
 _filter_preconditions["SPAtmplt"] = spa_tmplt_precondition
 
+_filter_norms["SPAtmpltTidal"] = spa_tmplt_norm
+_filter_preconditions["SPAtmpltTidal"] = spa_tmplt_precondition
+
 _filter_ends["SPAtmplt"] = spa_tmplt_end
+_filter_ends["SPAtmpltTidal"] = spa_tmplt_end
 _filter_ends["TaylorF2"] = spa_tmplt_end
 #_filter_ends["SEOBNRv1_ROM_EffectiveSpin"] = seobnrv2_final_frequency
 #_filter_ends["SEOBNRv1_ROM_DoubleSpin"] =  seobnrv2_final_frequency
@@ -1095,7 +1103,9 @@ _filter_ends["TaylorF2"] = spa_tmplt_end
 #_filter_ends["IMRPhenomD"] = seobnrv2_final_frequency
 
 _template_amplitude_norms["SPAtmplt"] = spa_amplitude_factor
+_template_amplitude_norms["SPAtmpltTidal"] = spa_amplitude_factor
 _filter_time_lengths["SPAtmplt"] = spa_length_in_time
+_filter_time_lengths["SPAtmpltTidal"] = spa_length_in_time
 _filter_time_lengths["TaylorF2"] = spa_length_in_time
 _filter_time_lengths["SpinTaylorT5"] = spa_length_in_time
 _filter_time_lengths["SEOBNRv1_ROM_EffectiveSpin"] = seobnrv2_length_in_time

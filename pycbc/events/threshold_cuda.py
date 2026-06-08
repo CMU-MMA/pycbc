@@ -32,9 +32,9 @@ import pycbc.scheme
 logger = logging.getLogger('pycbc.events.threshold_cuda')
 
 threshold_op = """
-    if (i == 0)
-        bn[0] = 0;
-
+    // NB: the counter *bn is zeroed from the host before each launch.
+    // An in-kernel "if (i == 0) bn[0] = 0;" would race with other threads'
+    // atomicAdd (thread 0 is not guaranteed to run first), so it is omitted.
     pycuda::complex<float> val = in[i];
     if ( abs(val) > threshold){
         int n_w = atomicAdd(bn, 1);
@@ -56,13 +56,20 @@ threshold_kernel = ElementwiseKernel(
             "getstuff")
 
 import pycuda.driver as drv
+
+# Capacity (in samples) of the device-mapped output buffers below. Starts at the
+# historical default and is grown on demand by _ensure_threshold_buffers() so
+# that threshold_only() can never overflow the buffers (one above-threshold
+# sample per input sample in the worst case).
+threshold_buffer_size = 4096*256
+
 n = drv.pagelocked_empty((1), numpy.uint32, mem_flags=drv.host_alloc_flags.DEVICEMAP)
 nptr = numpy.intp(n.base.get_device_pointer())
 
-val = drv.pagelocked_empty((4096*256), numpy.complex64, mem_flags=drv.host_alloc_flags.DEVICEMAP)
+val = drv.pagelocked_empty((threshold_buffer_size), numpy.complex64, mem_flags=drv.host_alloc_flags.DEVICEMAP)
 vptr = numpy.intp(val.base.get_device_pointer())
 
-loc = drv.pagelocked_empty((4096*256), numpy.int32, mem_flags=drv.host_alloc_flags.DEVICEMAP)
+loc = drv.pagelocked_empty((threshold_buffer_size), numpy.int32, mem_flags=drv.host_alloc_flags.DEVICEMAP)
 lptr = numpy.intp(loc.base.get_device_pointer())
 
 class T():
@@ -75,6 +82,26 @@ tn.gpudata = nptr
 tv.gpudata = vptr
 tl.gpudata = lptr
 tn.flags = tv.flags = tl.flags = n.flags
+
+
+def _ensure_threshold_buffers(nrequired):
+    """Grow the device-mapped ``val``/``loc`` output buffers so they can hold at
+    least ``nrequired`` above-threshold samples.  The threshold-only kernel has
+    no bounds check and writes one entry per crossing, so the buffers must be at
+    least as long as the input series to be safe against overflow.
+    """
+    global val, vptr, loc, lptr, threshold_buffer_size
+    if nrequired <= threshold_buffer_size:
+        return
+    val = drv.pagelocked_empty((nrequired), numpy.complex64,
+                               mem_flags=drv.host_alloc_flags.DEVICEMAP)
+    vptr = numpy.intp(val.base.get_device_pointer())
+    loc = drv.pagelocked_empty((nrequired), numpy.int32,
+                               mem_flags=drv.host_alloc_flags.DEVICEMAP)
+    lptr = numpy.intp(loc.base.get_device_pointer())
+    tv.gpudata = vptr
+    tl.gpudata = lptr
+    threshold_buffer_size = nrequired
 
 tkernel1 = mako.template.Template("""
 #include <stdio.h>
@@ -257,6 +284,76 @@ def threshold_and_cluster(series, threshold, window):
     pycbc.scheme.mgr.state.context.synchronize()
     w = (cl != -1)
     return cv[w], cl[w]
+
+def threshold_only(series, value):
+    """Return the locations and values of every sample of ``series`` whose
+    magnitude exceeds ``value`` (i.e. real**2 + imag**2 > value**2), without
+    any clustering.
+
+    Returns
+    -------
+    locations : numpy.ndarray (uint32)
+        Indices of the above-threshold samples.
+    values : numpy.ndarray (complex64)
+        The corresponding complex sample values.
+
+    Note the return order is (locations, values), matching
+    ``pycbc.events.threshold_cpu.threshold_only``.  This is the OPPOSITE of
+    ``threshold_and_cluster`` in this module, which returns (values, locations).
+    """
+    N = len(series)
+    if N == 0:
+        return (numpy.array([], dtype=numpy.uint32),
+                numpy.array([], dtype=numpy.complex64))
+
+    # The kernel writes one entry per crossing with no bounds check, so the
+    # output buffers must be able to hold up to N entries.
+    _ensure_threshold_buffers(N)
+
+    # Zero the counter from the host *before* launch (see threshold_op).
+    n[0] = 0
+
+    # threshold_op compares abs(val) > threshold, i.e. sqrt(re^2+im^2) > value,
+    # which is equivalent to the CPU's re^2 + im^2 > value^2 for value >= 0.
+    threshold = numpy.float32(value)
+
+    # Iterate over exactly the N samples of the series; tv/tl/tn are the
+    # device-mapped output/counter shims (same objects used by
+    # threshold_and_cluster).
+    threshold_kernel(series.data, tv, tl, threshold, tn,
+                     range=slice(0, N, 1))
+
+    # The counter and buffers are device-mapped host memory; synchronize before
+    # reading them back on the host.
+    pycbc.scheme.mgr.state.context.synchronize()
+
+    num = int(n[0])
+    if num > threshold_buffer_size:
+        # Should be impossible given _ensure_threshold_buffers above, but never
+        # silently truncate: a saturated counter means the buffers overflowed.
+        raise RuntimeError(
+            "threshold_only overflowed its output buffers: counted %d "
+            "crossings but buffers hold only %d" % (num, threshold_buffer_size))
+
+    if num == 0:
+        return (numpy.array([], dtype=numpy.uint32),
+                numpy.array([], dtype=numpy.complex64))
+
+    # loc is allocated int32 but the locations must be returned as uint32.
+    # Copy out of the reused device-mapped buffers so the result is stable.
+    locations = loc[0:num].astype(numpy.uint32)
+    values = val[0:num].astype(numpy.complex64)
+
+    # The kernel compacts crossings in atomicAdd order, which is
+    # nondeterministic. Sort by location to match the CPU's index-ordered
+    # output (threshold_cpu.threshold_only).
+    order = numpy.argsort(locations, kind='stable')
+    return locations[order], values[order]
+
+
+# As in threshold_cpu, threshold and threshold_only are the same operation.
+threshold = threshold_only
+
 
 class CUDAThresholdCluster(_BaseThresholdCluster):
     def __init__(self, series):

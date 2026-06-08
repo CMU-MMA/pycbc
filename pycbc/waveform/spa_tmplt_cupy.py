@@ -64,6 +64,19 @@ taylorf2_text = mako.template.Template("""
         default:
             break;
     }
+
+    // TaylorF2 tidal terms (5PN v^10, 6PN v^12, 6.5PN v^13, 7PN v^14); all
+    // coefficients are 0 for the point-particle SPAtmplt, so this is a no-op
+    // there.
+    const float v10 = v5 * v5;
+    const float v12 = v6 * v6;
+    const float v13 = v12 * v;
+    const float v14 = v7 * v7;
+    phasing += pfa10 * v10;
+    phasing += pfa12 * v12;
+    phasing += pfa13 * v13;
+    phasing += pfa14 * v14;
+
     phasing *= pfaN / v5;
     phasing -=  PI_4;
     phasing -= int(phasing / (TWOPI)) * TWOPI;
@@ -81,7 +94,8 @@ taylorf2_kernel = cp.ElementwiseKernel(
     """
         int64 kmin, int64 phase_order, float32 delta_f, float32 piM,
         float32 pfaN, float32 pfa2, float32 pfa3, float32 pfa4, float32 pfa5,
-        float32 pfl5, float32 pfa6, float32 pfl6, float32 pfa7, float32 amp
+        float32 pfl5, float32 pfa6, float32 pfl6, float32 pfa7, float32 amp,
+        float32 pfa10, float32 pfa12, float32 pfa13, float32 pfa14
     """,
     "complex64 htilde",
     taylorf2_text,
@@ -92,10 +106,12 @@ taylorf2_kernel = cp.ElementwiseKernel(
 def spa_tmplt_engine(htilde,  kmin,  phase_order,
                     delta_f,  piM,  pfaN,
                     pfa2,  pfa3,  pfa4,  pfa5,  pfl5,
-                    pfa6,  pfl6,  pfa7, amp_factor):
+                    pfa6,  pfl6,  pfa7, amp_factor,
+                    pfa10=0.0, pfa12=0.0, pfa13=0.0, pfa14=0.0):
     """ Calculate the spa tmplt phase
     """
     taylorf2_kernel(kmin,  phase_order,
                     delta_f,  piM,  pfaN,
                     pfa2,  pfa3,  pfa4,  pfa5,  pfl5,
-                    pfa6,  pfl6,  pfa7, amp_factor, htilde.data)
+                    pfa6,  pfl6,  pfa7, amp_factor,
+                    pfa10, pfa12, pfa13, pfa14, htilde.data)

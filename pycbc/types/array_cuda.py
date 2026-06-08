@@ -284,7 +284,7 @@ abs_max_loc_map = {'single':{ 'real':amls, 'complex':amlsc }, 'double':{ 'real':
 
 def zeros(length, dtype=np.float64):
     result = GPUArray(length, dtype=dtype)
-    nwords = result.nbytes / 4
+    nwords = result.nbytes // 4
     pycuda.driver.memset_d32(result.gpudata, 0, nwords)
     return result
 
@@ -339,7 +339,7 @@ def sum(self):
     return pycuda.gpuarray.sum(self._data).get().max()
     
 def clear(self):
-    n32 = self.data.nbytes / 4
+    n32 = self.data.nbytes // 4
     pycuda.driver.memset_d32(self.data.gpudata, 0, n32)
     
 def _scheme_matches_base_array(array):
