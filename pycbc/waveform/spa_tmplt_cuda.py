@@ -63,6 +63,19 @@ taylorf2_text = """
         default:
             break;
     }
+
+    // TaylorF2 tidal terms (5PN v^10, 6PN v^12, 6.5PN v^13, 7PN v^14); all
+    // coefficients are 0 for the point-particle SPAtmplt, so this is a no-op
+    // there.
+    const float v10 = v5 * v5;
+    const float v12 = v6 * v6;
+    const float v13 = v12 * v;
+    const float v14 = v7 * v7;
+    phasing += pfa10 * v10;
+    phasing += pfa12 * v12;
+    phasing += pfa13 * v13;
+    phasing += pfa14 * v14;
+
     phasing *= pfaN / v5;
     phasing -= (PI_4);
     phasing -= int(phasing / (TWOPI)) * TWOPI;
@@ -78,17 +91,20 @@ taylorf2_text = """
 taylorf2_kernel = ElementwiseKernel("""pycuda::complex<float> *htilde, int kmin, int phase_order,
                                        float delta_f, float TWOPI, float PI_4, float piM, float pfaN,
                                        float pfa2, float pfa3, float pfa4, float pfa5, float pfl5,
-                                       float pfa6, float pfl6, float pfa7, float amp""",
+                                       float pfa6, float pfl6, float pfa7, float amp,
+                                       float pfa10, float pfa12, float pfa13, float pfa14""",
                     taylorf2_text, "SPAtmplt",
                     preamble=preamble)
 
 def spa_tmplt_engine(htilde,  kmin,  phase_order,
                     delta_f,  piM,  pfaN,
                     pfa2,  pfa3,  pfa4,  pfa5,  pfl5,
-                    pfa6,  pfl6,  pfa7, amp_factor):
+                    pfa6,  pfl6,  pfa7, amp_factor,
+                    pfa10=0.0, pfa12=0.0, pfa13=0.0, pfa14=0.0):
     """ Calculate the spa tmplt phase
     """
     taylorf2_kernel(htilde.data,  kmin,  phase_order,
                     delta_f, TWOPI, PI_4, piM,  pfaN,
                     pfa2,  pfa3,  pfa4,  pfa5,  pfl5,
-                    pfa6,  pfl6,  pfa7, amp_factor)
+                    pfa6,  pfl6,  pfa7, amp_factor,
+                    pfa10, pfa12, pfa13, pfa14)

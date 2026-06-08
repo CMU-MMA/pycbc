@@ -64,12 +64,14 @@ cdef spa_tmplt_inline(float piM, float pfaN,
                       numpy.ndarray[numpy.float32_t, ndim=1] _cbrt_vec,
                       numpy.ndarray[numpy.float32_t, ndim=1] _kfac,
                       numpy.ndarray[numpy.complex64_t, ndim=1] _htilde,
+                      float pfa10=0.0, float pfa12=0.0,
+                      float pfa13=0.0, float pfa14=0.0,
                       ):
     cdef float piM13 = cbrt(piM)
     cdef float logpiM13 = log(piM13)
     cdef float log4 = log(4.)
     cdef float two_pi = 2 * M_PI
-    cdef float v, logv, v5, phasing, amp
+    cdef float v, logv, v5, v10, v12, v13, v14, phasing, amp
 
     cdef float complex* htilde = &_htilde[0]
     cdef float* kfac = &_kfac[0]
@@ -82,6 +84,10 @@ cdef spa_tmplt_inline(float piM, float pfaN,
         logv = logv_vec[i] * 1.0/3.0 + logpiM13
         amp = ampc * kfac[i]
         v5 = v * v * v * v * v
+        v10 = v5 * v5
+        v12 = v10 * v * v
+        v13 = v12 * v
+        v14 = v13 * v
 
         phasing = pfa7 * v
         phasing = (phasing + pfa6 + pfl6 * (logv + log4) ) * v
@@ -89,6 +95,9 @@ cdef spa_tmplt_inline(float piM, float pfaN,
         phasing = (phasing + pfa4) * v
         phasing = (phasing + pfa3) * v
         phasing = (phasing + pfa2) * v * v + 1
+        # TaylorF2 tidal terms (5PN v^10, 6PN v^12, 6.5PN v^13, 7PN v^14);
+        # all zero for SPAtmplt
+        phasing = phasing + pfa10 * v10 + pfa12 * v12 + pfa13 * v13 + pfa14 * v14
 
         phasing = phasing * pfaN / v5 - M_PI_4
         phasing -= <int>(phasing / two_pi) * two_pi
@@ -121,12 +130,14 @@ def spa_tmplt_inline_sequence(float piM, float pfaN,
                       float ampc,
                       numpy.ndarray[numpy.float32_t, ndim=1] _fvals,
                       numpy.ndarray[numpy.complex64_t, ndim=1] _htilde,
+                      float pfa10=0.0, float pfa12=0.0,
+                      float pfa13=0.0, float pfa14=0.0,
                       ):
     cdef float piM13 = cbrt(piM)
     cdef float logpiM13 = log(piM13)
     cdef float log4 = log(4.)
     cdef float two_pi = 2 * M_PI
-    cdef float v, logv, v5, phasing, amp
+    cdef float v, logv, v5, v10, v12, v13, v14, phasing, amp
 
     cdef float complex* htilde = &_htilde[0]
     cdef float* fvals = &_fvals[0]
@@ -138,6 +149,10 @@ def spa_tmplt_inline_sequence(float piM, float pfaN,
         logv = log(f) * 1.0/3.0 + logpiM13
         amp = ampc * f ** (-7.0/6.0)
         v5 = v * v * v * v * v
+        v10 = v5 * v5
+        v12 = v10 * v * v
+        v13 = v12 * v
+        v14 = v13 * v
 
         phasing = pfa7 * v
         phasing = (phasing + pfa6 + pfl6 * (logv + log4) ) * v
@@ -145,6 +160,9 @@ def spa_tmplt_inline_sequence(float piM, float pfaN,
         phasing = (phasing + pfa4) * v
         phasing = (phasing + pfa3) * v
         phasing = (phasing + pfa2) * v * v + 1
+        # TaylorF2 tidal terms (5PN v^10, 6PN v^12, 6.5PN v^13, 7PN v^14);
+        # all zero for SPAtmplt
+        phasing = phasing + pfa10 * v10 + pfa12 * v12 + pfa13 * v13 + pfa14 * v14
 
         phasing = phasing * pfaN / v5 - M_PI_4
         phasing -= <int>(phasing / two_pi) * two_pi
@@ -168,7 +186,8 @@ def spa_tmplt_inline_sequence(float piM, float pfaN,
 
 def spa_tmplt_engine(htilde,  kmin,  phase_order, delta_f, piM,  pfaN,
                     pfa2,  pfa3,  pfa4,  pfa5,  pfl5,
-                    pfa6,  pfl6,  pfa7, amp_factor):
+                    pfa6,  pfl6,  pfa7, amp_factor,
+                    pfa10=0.0, pfa12=0.0, pfa13=0.0, pfa14=0.0):
     """ Calculate the spa tmplt phase
     """
     kfac = spa_tmplt_precondition(len(htilde), delta_f, kmin).data
@@ -177,4 +196,5 @@ def spa_tmplt_engine(htilde,  kmin,  phase_order, delta_f, piM,  pfaN,
     spa_tmplt_inline(piM, pfaN, pfa2, pfa3, pfa4, pfa5, pfl5,
                       pfa6, pfl6, pfa7, amp_factor,
                       kmin, logv_vec, cbrt_vec, kfac, htilde.data,
+                      pfa10, pfa12, pfa13, pfa14,
                       )

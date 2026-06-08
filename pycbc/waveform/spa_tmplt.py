@@ -166,8 +166,16 @@ def spa_distance(psd, mass1, mass2, lower_frequency_cutoff, snr=8):
 @schemed("pycbc.waveform.spa_tmplt_")
 def spa_tmplt_engine(htilde, kmin, phase_order, delta_f, piM, pfaN,
                      pfa2, pfa3, pfa4, pfa5, pfl5,
-                     pfa6, pfl6, pfa7, amp_factor):
+                     pfa6, pfl6, pfa7, amp_factor,
+                     pfa10=0.0, pfa12=0.0, pfa13=0.0, pfa14=0.0):
     """ Calculate the spa tmplt phase
+
+    ``pfa10`` (5PN), ``pfa12`` (6PN), ``pfa13`` (6.5PN) and ``pfa14`` (7PN)
+    are the TaylorF2 tidal phase coefficients (normalised by ``pfaN``). They
+    default to zero so that point-particle ``SPAtmplt`` callers are
+    unaffected; ``spa_tmplt_tidal`` supplies non-zero values. LAL populates
+    all four of these orders for non-zero tidal deformability (there is no
+    v^11 tidal term and the tidal log terms vanish).
     """
     err_msg = "This function is a stub that should be overridden using the "
     err_msg += "scheme. You shouldn't be seeing this error!"
@@ -267,5 +275,133 @@ def spa_tmplt(**kwds):
         spa_tmplt_inline_sequence(
             piM, pfaN, pfa2, pfa3, pfa4, pfa5, pfl5, pfa6, pfl6, pfa7,
             amp_factor, kwds['sample_points'], htilde)
+
+    return htilde
+
+
+def spa_tmplt_tidal(**kwds):
+    """ Generate a minimal TaylorF2 approximant including the 5PN and 6PN
+    tidal phase terms, with optimizations for the sin/cos.
+
+    This is a clone of :func:`spa_tmplt` that additionally inserts the tidal
+    deformabilities ``lambda1``/``lambda2`` into the LAL phasing call, reads
+    the resulting 5PN (``v^10``) and 6PN (``v^12``) phase coefficients, and
+    forwards them to the backend engine. With ``lambda1 = lambda2 = 0`` the
+    extra coefficients are zero and the result reduces bit-for-bit to
+    :func:`spa_tmplt`.
+    """
+    distance = kwds['distance']
+    mass1 = kwds['mass1']
+    mass2 = kwds['mass2']
+    s1z = kwds['spin1z']
+    s2z = kwds['spin2z']
+    phase_order = int(kwds['phase_order'])
+    #amplitude_order = int(kwds['amplitude_order'])
+    spin_order = int(kwds['spin_order'])
+
+    lambda1 = float(kwds.get('lambda1', 0.0))
+    lambda2 = float(kwds.get('lambda2', 0.0))
+
+    if 'out' in kwds:
+        out = kwds['out']
+    else:
+        out = None
+
+    amp_factor = spa_amplitude_factor(mass1=mass1, mass2=mass2) / distance
+
+    lal_pars = lal.CreateDict()
+    if phase_order != -1:
+        lalsimulation.SimInspiralWaveformParamsInsertPNPhaseOrder(
+            lal_pars, phase_order)
+
+    if spin_order != -1:
+        lalsimulation.SimInspiralWaveformParamsInsertPNSpinOrder(
+            lal_pars, spin_order)
+
+    # Insert the tidal deformabilities; with lambda1 = lambda2 = 0 these are
+    # no-ops and the v[10]/v[12] coefficients below come out as 0.
+    lalsimulation.SimInspiralWaveformParamsInsertTidalLambda1(lal_pars, lambda1)
+    lalsimulation.SimInspiralWaveformParamsInsertTidalLambda2(lal_pars, lambda2)
+
+    # Calculate the PN terms
+    phasing = lalsimulation.SimInspiralTaylorF2AlignedPhasing(
+                                    float(mass1), float(mass2),
+                                    float(s1z), float(s2z),
+                                    lal_pars)
+
+    pfaN = phasing.v[0]
+    pfa2 = phasing.v[2] / pfaN
+    pfa3 = phasing.v[3] / pfaN
+    pfa4 = phasing.v[4] / pfaN
+    pfa5 = phasing.v[5] / pfaN
+    pfa6 = (phasing.v[6] - phasing.vlogv[6] * log(4)) / pfaN
+    pfa7 = phasing.v[7] / pfaN
+
+    pfl5 = phasing.vlogv[5] / pfaN
+    pfl6 = phasing.vlogv[6] / pfaN
+
+    # Tidal phase coefficients. LAL's TaylorF2 tidal phasing populates four
+    # orders: 5PN (v^10), 6PN (v^12), 6.5PN (v^13) and 7PN (v^14). All have
+    # zero log terms (vlogv[10,12,13,14] = 0). v^11 carries no tidal term.
+    # Carrying only v^10/v^12 leaves a residual that grows linearly with
+    # lambda, so all four are required to reduce to LAL.
+    pfa10 = phasing.v[10] / pfaN
+    pfa12 = phasing.v[12] / pfaN
+    pfa13 = phasing.v[13] / pfaN
+    pfa14 = phasing.v[14] / pfaN
+    assert (phasing.vlogv[10] == 0.0 and phasing.vlogv[12] == 0.0
+            and phasing.vlogv[13] == 0.0 and phasing.vlogv[14] == 0.0), \
+        "unexpected non-zero tidal log terms in TaylorF2 phasing"
+
+    piM = PI * (mass1 + mass2) * MTSUN_SI
+
+    if 'sample_points' not in kwds:
+        f_lower = kwds['f_lower']
+        delta_f = kwds['delta_f']
+        kmin = int(f_lower / float(delta_f))
+
+        # Get max frequency one way or another
+        # f_final is assigned default value 0 in parameters.py
+        if 'f_final' in kwds and kwds['f_final'] > 0.:
+            fstop = kwds['f_final']
+        elif 'f_upper' in kwds:
+            fstop = kwds['f_upper']
+            warnings.warn('f_upper is deprecated in favour of f_final!',
+                          DeprecationWarning)
+        else:
+            # Schwarzschild ISCO frequency
+            vISCO = 1. / sqrt(6.)
+            fstop = vISCO * vISCO * vISCO / piM
+        if fstop <= f_lower:
+            raise ValueError("cannot generate waveform! f_lower >= f_final"
+                             f" ({f_lower}, {fstop})")
+
+        kmax = int(fstop / delta_f)
+        f_max = ceilpow2(fstop)
+        n = int(f_max / delta_f) + 1
+
+        if not out:
+            htilde = FrequencySeries(zeros(n, dtype=numpy.complex64), delta_f=delta_f, copy=False)
+        else:
+            if type(out) is not Array:
+                raise TypeError("Output must be an instance of Array")
+            if len(out) < kmax:
+                kmax = len(out)
+            if out.dtype != complex64:
+                raise TypeError("Output array is the wrong dtype")
+            htilde = FrequencySeries(out, delta_f=delta_f, copy=False)
+
+        spa_tmplt_engine(htilde[kmin:kmax], kmin, phase_order,
+                         delta_f, piM, pfaN,
+                         pfa2, pfa3, pfa4, pfa5, pfl5,
+                         pfa6, pfl6, pfa7, amp_factor,
+                         pfa10, pfa12, pfa13, pfa14)
+    else:
+        from .spa_tmplt_cpu import spa_tmplt_inline_sequence
+        htilde = numpy.empty(len(kwds['sample_points']), dtype=numpy.complex64)
+        spa_tmplt_inline_sequence(
+            piM, pfaN, pfa2, pfa3, pfa4, pfa5, pfl5, pfa6, pfl6, pfa7,
+            amp_factor, kwds['sample_points'], htilde,
+            pfa10, pfa12, pfa13, pfa14)
 
     return htilde
