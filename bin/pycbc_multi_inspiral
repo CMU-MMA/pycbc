@@ -125,6 +125,14 @@ parser.add_argument(
     help="The integer half-PN order at which to generate the approximant.",
 )
 parser.add_argument(
+    "--max-template-duration",
+    type=float,
+    default=None,
+    help="Per-template cap on waveform duration (seconds). Templates "
+    "longer than this at --low-frequency-cutoff have their start "
+    "frequency raised until they fit the analysis segment. Default: no cap.",
+)
+parser.add_argument(
     "--taper-template",
     choices=["start", "end", "startend"],
     help="For time-domain approximants, taper the start "
@@ -615,6 +623,7 @@ with ctx:
         phase_order=args.order,
         taper=args.taper_template,
         approximant=args.approximant,
+        max_template_length=args.max_template_duration,
         out=template_mem,
     )
 
