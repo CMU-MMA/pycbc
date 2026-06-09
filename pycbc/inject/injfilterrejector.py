@@ -185,6 +185,15 @@ class InjFilterRejector(object):
             )
         ):
             self.enabled = False
+            # Even when disabled, expose the attributes that callers query
+            # unconditionally (e.g. InjectionSet.apply reads match_threshold,
+            # and template thinning/segment checks read chirp_time_window and
+            # inj_trigger_window). Leaving them unset raises AttributeError for
+            # any --injection-file run that doesn't also pass the
+            # injection-filter-rejector options.
+            self.chirp_time_window = None
+            self.match_threshold = None
+            self.inj_trigger_window = None
             return
         self.enabled = True
 

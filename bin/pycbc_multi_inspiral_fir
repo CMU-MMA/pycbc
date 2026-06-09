@@ -1,0 +1,650 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2026 Xander Hall
+# Copyright (C) 2026 (SSM GPU Acceleration)
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+"""Coherent, FIR-de-chirped multi-detector directed search.
+
+This is a Ratio-Filter (FIR de-chirping) accelerated version of
+``pycbc_multi_inspiral``. It performs the same directed (known sky position)
+coherent multi-detector matched filter -- computing coherent SNR, null SNR,
+the polarization projection and feeding ``EventManagerCoherent`` -- but
+replaces the per-detector brute-force matched filter with the hierarchical
+ratio engine (``pycbc.filter.matched_ratio.RatioMatchedFilterControl``):
+
+  * For each coarse reference template, the full matched-filter SNR time series
+    is computed once per detector (``compute_reference_snr``).
+  * Each fine template's complex SNR time series is then reconstructed in every
+    detector by FIR-filtering that reference SNR with the fine template's
+    (detector-independent) ratio taps (``fine_snr_timeseries``).
+  * Those per-detector SNR time series feed the unchanged coherent statistic.
+
+Method: Nitz, Kacanja & Soni 2026 (arXiv:2601.18835). Coherent statistic:
+Harry & Fairhurst 2011 (arXiv:1012.4939); Williamson et al. 2014
+(arXiv:1410.6042).
+
+NOTE (Phase 1, CPU): the chi-square based vetoes (power, bank, auto) are
+stubbed to zero here -- the FIR engine does not yet reproduce the per-detector
+correlation vector the power chi-square needs. The coherent/coincident/null
+SNR machinery (the correctness gate against brute force) is exact. Re-weighted
+SNR therefore reduces to coherent SNR.
+"""
+
+import logging
+import time
+import argparse
+import numpy as np
+
+from pycbc import (
+    fft,
+    init_logging,
+    inject,
+    opt,
+    psd,
+    scheme,
+    strain,
+    vetoes,
+    waveform,
+    DYN_RANGE_FAC,
+    add_common_pycbc_options,
+)
+from pycbc.events import ranking, coherent as coh, EventManagerCoherent
+from pycbc.filter.matched_ratio import RatioMatchedFilterControl
+from pycbc.types import zeros, float32, complex64, angle_as_radians
+from pycbc.waveform.bank import RatioFilterBank
+from pycbc.tmpltbank.sky_grid import SkyGrid
+
+
+def slide_limiter(n_ifos, slide_shift, segment_length):
+    '''
+    Compute the number of short slides used by the coherent matched filter
+    statistic, bounded to avoid counting triggers more than once.
+    '''
+    low, upp = 1, segment_length
+    if n_ifos == 1:
+        return 1
+    stride_dur = segment_length / 2
+    num_slides = 1 + int(stride_dur / (slide_shift * (n_ifos - 1)))
+    assert (num_slides >= low) and (num_slides <= upp), \
+        "the combination (slideshift, segment_dur)" \
+        f" = ({slide_shift:.2f},{stride_dur*2:.2f})" \
+        f" goes over the allowed upper bound {upp}"
+    return num_slides
+
+
+time_init = time.time()
+parser = argparse.ArgumentParser(description=__doc__)
+add_common_pycbc_options(parser)
+parser.add_argument("--output", type=str, required=True,
+                    help="Path to the output file.")
+parser.add_argument("--instruments", nargs="+", type=str, required=True,
+                    help="List of instruments to analyze.")
+parser.add_argument("--bank-file", type=str, required=True,
+                    help="Path to the hierarchical Ratio-Filter bank file "
+                         "(built by pycbc_fir_bank): a fine bank at the root "
+                         "plus coarse references and FIR taps under fir_data.")
+parser.add_argument("--low-frequency-cutoff", type=float, required=True,
+                    help="The low frequency cutoff to use for filtering (Hz).")
+waveform.bank.add_approximant_arg(parser)
+parser.add_argument("--order", type=str,
+                    help="The integer half-PN order at which to generate the "
+                         "approximant.")
+parser.add_argument("--cluster-method", choices=["template", "window"],
+                    default="window",
+                    help="Method to use when clustering triggers.")
+parser.add_argument("--cluster-window", type=float, default=0,
+                    help="Length of clustering window in seconds.")
+# Retained for EventManager/CLI compatibility (chi-square is stubbed in Phase 1)
+parser.add_argument("--bank-veto-bank-file", type=str,
+                    help="(Unused in Phase 1.) Path to the bank-veto bank.")
+parser.add_argument("--chisq-bins", default=0,
+                    help="(Unused in Phase 1.)")
+parser.add_argument("--autochi-number-points", type=int, default=0)
+parser.add_argument("--autochi-stride", type=int, default=0)
+parser.add_argument("--autochi-two-phase", action="store_true", default=False)
+parser.add_argument("--autochi-onesided", action='store',
+                    choices=['left', 'right'])
+parser.add_argument("--autochi-reverse-template", action="store_true",
+                    default=False)
+parser.add_argument("--autochi-max-valued", action="store_true", default=False)
+parser.add_argument("--autochi-max-valued-dof", action="store", metavar="INT",
+                    type=int)
+parser.add_argument("--ra", type=angle_as_radians,
+                    help="Right ascension of a single sky point to search.")
+parser.add_argument("--dec", type=angle_as_radians,
+                    help="Declination of a single sky point to search.")
+parser.add_argument("--sky-grid", type=str,
+                    help="Path to an HDF file containing the sky grid.")
+parser.add_argument("--coinc-threshold", type=float, default=0.0,
+                    help="Triggers with coincident/coherent SNR below this "
+                         "value will be discarded.")
+parser.add_argument("--nifo-sngl-snr-threshold", action="store", type=int,
+                    default=2,
+                    help="How many detectors must pass the "
+                         "--sngl-snr-threshold cut to generate a trigger.")
+parser.add_argument("--sngl-snr-threshold", action="store", type=float,
+                    default=4.0, metavar='THRESHOLD',
+                    help="Single detector SNR threshold for trigger "
+                         "generation (default: 4).")
+parser.add_argument("--chisq-index", action="store", type=float, default=6.0,
+                    help="chisq-index (q) for reweighting (default: 6).")
+parser.add_argument("--chisq-nhigh", action="store", type=float, default=2.0,
+                    help="chisq-nhigh (n) for reweighting (default: 2).")
+parser.add_argument("--do-null-cut", action='store_true',
+                    help="Apply a cut based on null SNR.")
+parser.add_argument("--null-min", type=float, default=5.25)
+parser.add_argument("--null-grad", type=float, default=0.2)
+parser.add_argument("--null-step", type=float, default=20.0)
+parser.add_argument("--trigger-time", type=int,
+                    help="Time of the GRB, used to set the antenna patterns.")
+parser.add_argument("--projection", default="standard",
+                    choices=["standard", "left", "right", "left+right"],
+                    help="Choice of projection matrix.")
+parser.add_argument("--slide-shift", type=float, default=1.0,
+                    help="Size of each time slide shift.")
+parser.add_argument("--do-shortslides", action="store_true")
+
+# --- Ratio-Filter (FIR) engine options ---
+fir_group = parser.add_argument_group("Ratio-Filter (FIR) engine options")
+fir_group.add_argument("--fir-length", type=int, default=4096,
+                       help="Overlap-save FFT block length for the FIR engine "
+                            "(samples at the engine rate; default 4096).")
+fir_group.add_argument("--batch-size", type=int, default=64,
+                       help="Number of FIR filters processed per FFT batch.")
+fir_group.add_argument("--high-frequency-cutoff", type=float,
+                       help="High frequency cutoff for the reference matched "
+                            "filter (defaults to Nyquist).")
+fir_group.add_argument("--template-normalization-method",
+                       choices=('precalculated_sigma', 'mchirp'),
+                       default='mchirp',
+                       help="Method to normalize fine templates relative to "
+                            "their coarse reference (default: mchirp).")
+fir_group.add_argument("--fft-workers", type=int, default=None,
+                       help="Number of threads for the CPU (scipy) batched "
+                            "FFTs in the FIR engine.")
+
+strain.insert_strain_option_group_multi_ifo(parser)
+strain.StrainSegments.insert_segment_option_group_multi_ifo(parser)
+psd.insert_psd_option_group_multi_ifo(parser)
+scheme.insert_processing_option_group(parser)
+fft.insert_fft_option_group(parser)
+opt.insert_optimization_option_group(parser)
+inject.insert_injfilterrejector_option_group_multi_ifo(parser)
+args = parser.parse_args()
+init_logging(args.verbose)
+
+nifo = len(args.instruments)
+num_slides = 1
+if args.do_shortslides:
+    num_slides = slide_limiter(
+        nifo, args.slide_shift, args.segment_length[args.instruments[0]]
+    )
+args.instruments.sort()
+if nifo > 1 and nifo < args.nifo_sngl_snr_threshold:
+    parser.error("--nifo-sngl-snr-threshold "
+                 f"({args.nifo_sngl_snr_threshold}) cannot exceed the "
+                 f"number of detectors ({nifo}).")
+
+strain.verify_strain_options_multi_ifo(args, parser, args.instruments)
+strain.StrainSegments.verify_segment_options_multi_ifo(
+    args, parser, args.instruments
+)
+psd.verify_psd_options_multi_ifo(args, parser, args.instruments)
+scheme.verify_processing_options(args, parser)
+fft.verify_fft_options(args, parser)
+
+inj_filter_rejector = inject.InjFilterRejector.from_cli_multi_ifos(
+    args, args.instruments
+)
+strain_dict = strain.from_cli_multi_ifos(
+    args, args.instruments, inj_filter_rejector, dyn_range_fac=DYN_RANGE_FAC
+)
+strain_segments_dict = strain.StrainSegments.from_cli_multi_ifos(
+    args, strain_dict, args.instruments
+)
+
+ctx = scheme.from_cli(args)
+with ctx:
+    num_cpu_cores = 1
+    if hasattr(ctx, "num_threads"):
+        num_cpu_cores = ctx.num_threads
+    fft.from_cli(args)
+    flow = args.low_frequency_cutoff
+    t_gps = args.trigger_time
+    sky_positions = SkyGrid.from_cli(parser, args)
+
+    for count, ifo in enumerate(args.instruments):
+        if count == 0:
+            sample_rate = strain_dict[ifo].sample_rate
+            flen = strain_segments_dict[ifo].freq_len
+            tlen = strain_segments_dict[ifo].time_len
+            delta_f = strain_segments_dict[ifo].delta_f
+        else:
+            err_msg = " must be consistent across all ifos."
+            assert sample_rate == strain_dict[ifo].sample_rate, \
+                "Sample rate" + err_msg
+            assert flen == strain_segments_dict[ifo].freq_len, \
+                "Frequency length" + err_msg
+            assert tlen == strain_segments_dict[ifo].time_len, \
+                "Time length" + err_msg
+            assert delta_f == strain_segments_dict[ifo].delta_f, \
+                "delta_f" + err_msg
+
+    logging.info("Making frequency-domain data segments")
+    segments = {
+        ifo: strain_segments_dict[ifo].fourier_segments()
+        for ifo in args.instruments
+    }
+    del strain_segments_dict
+    logging.info("Associating PSDs to them")
+    psd.associate_psds_to_multi_ifo_segments(
+        args, segments, strain_dict, flen, delta_f, flow, args.instruments,
+        dyn_range_factor=DYN_RANGE_FAC, precision='single',
+    )
+
+    logging.info("Determining time slide shifts and time delays")
+    slide_ids = np.arange(num_slides)
+    time_slides = {
+        ifo: args.slide_shift * slide_ids * ifo_idx
+        for ifo_idx, ifo in enumerate(args.instruments)
+    }
+    time_delays_zerolag = sky_positions.calculate_time_delays()
+    time_delay_idx = {
+        slide: {
+            position_index: {
+                ifo: round(
+                    (time_delays_zerolag[ifo][position_index]
+                     + time_slides[ifo][slide]) * sample_rate
+                )
+                for ifo in args.instruments
+            }
+            for position_index in range(len(sky_positions))
+        }
+        for slide in slide_ids
+    }
+    del time_delays_zerolag
+
+    # NOTE: Unlike pycbc_multi_inspiral, the data segments are NOT overwhitened
+    # here. The FIR engine's reference matched filter divides by the PSD itself
+    # (matched_filter_core(..., psd=psd)), so segments are left as raw FD data
+    # with an associated .psd.
+
+    logging.info("Setting up event manager")
+    ifo_out_types = {
+        'time_index': int, 'ifo': int, 'snr': complex64,
+        'chisq': float32, 'chisq_dof': int,
+        'bank_chisq': float32, 'bank_chisq_dof': int,
+        'auto_chisq': float32, 'auto_chisq_dof': int, 'slide_id': int,
+    }
+    ifo_out_vals = {k: None for k in ifo_out_types}
+    ifo_names = sorted(ifo_out_vals.keys())
+    network_out_types = {
+        'dec': float32, 'ra': float32, 'time_index': int,
+        'coherent_snr': float32, 'null_snr': float32, 'nifo': int,
+        'my_network_chisq': float32, 'reweighted_snr': float32,
+        'slide_id': int,
+    }
+    network_out_vals = {k: None for k in network_out_types}
+    network_names = list(network_out_vals.keys())
+    event_mgr = EventManagerCoherent(
+        args, args.instruments, ifo_names,
+        [ifo_out_types[n] for n in ifo_names],
+        network_names, [network_out_types[n] for n in network_names],
+        segments=segments, time_slides=time_slides,
+        gating_info={det: strain_dict[det].gating_info for det in strain_dict},
+    )
+
+    logging.info("Reading hierarchical Ratio-Filter bank")
+    bank = RatioFilterBank(
+        args.bank_file, flen, delta_f, complex64,
+        low_frequency_cutoff=flow, phase_order=args.order,
+        approximant=args.approximant,
+    )
+    for ifo in args.instruments:
+        bank.template_thinning(inj_filter_rejector[ifo])
+
+    n_coarse = len(bank.coarse_indices)
+    logging.info("Coarse references to process: %d", n_coarse)
+
+    logging.info("Setting up the Ratio-Filter engine per detector")
+    engines = {
+        ifo: RatioMatchedFilterControl(
+            snr_threshold=args.sngl_snr_threshold,
+            delta_f=delta_f,
+            high_frequency_cutoff=args.high_frequency_cutoff,
+            fir_fft_length=args.fir_length,
+            batch_size=args.batch_size,
+            tap_sample_rate=bank.sample_rate,
+            engine_sample_rate=sample_rate,
+            fft_workers=args.fft_workers,
+        )
+        for ifo in args.instruments
+    }
+
+    logging.info("Calculating antenna pattern functions at every sky position")
+    antenna_pattern = sky_positions.calculate_antenna_patterns()
+
+    n_seg = len(segments[args.instruments[0]])
+    time_setup = time.time() - time_init
+
+    logging.info("Starting the filtering...")
+    # Loop over coarse references; reconstruct fine-template SNR from each.
+    for c_num, coarse_idx in enumerate(bank.coarse_indices):
+        ref_template = bank.get_coarse_template(coarse_idx)
+        taps, counts, fine_indices = bank.get_firs(coarse_idx)
+        # FIR taps are detector-independent -> prepare the frequency-domain
+        # filters once for the whole coarse group.
+        filters_f, _ = engines[args.instruments[0]].prepare_filters(taps, counts)
+        n_fine = len(fine_indices)
+        # Use one overlap-save tap count for the whole coarse group (the group
+        # max). This is a valid (filter support fits) and result-invariant
+        # choice, and it lets every fine template in the group share the same
+        # block-FFT grid -> the (fine-template-independent) reference block FFTs
+        # are computed once per (segment, detector) and reused (essential for
+        # the batched GPU path; also speeds the CPU block-FFT cache).
+        n_taps_group = int(counts.max())
+        logging.info("Coarse %d/%d (idx %d): %d fine templates",
+                     c_num + 1, n_coarse, coarse_idx, n_fine)
+
+        # Compute the reference SNR once per (segment, detector) and cache it
+        # (plus a per-(segment, detector) block-FFT cache reused across all
+        # fine templates in this coarse group, and the reference sigmasq).
+        ref_cache = {}
+        for s_num in range(n_seg):
+            for ifo in args.instruments:
+                stilde_seg = segments[ifo][s_num]
+                h_norm = engines[ifo].compute_reference_snr(
+                    stilde_seg, stilde_seg.psd, ref_template
+                )
+                ref_cache[(s_num, ifo)] = (engines[ifo].ref_snr, {}, h_norm)
+
+        # Loop over fine templates (the EventManager "template" unit).
+        for j in range(n_fine):
+            global_id = int(fine_indices[j])
+            n_taps_j = int(counts[j])
+            filt = filters_f[j]
+            snr_rescale = float(
+                bank.snr_rescale(global_id,
+                                 method=args.template_normalization_method)
+            )
+            sig_rescale = float(
+                bank.sigma_rescale(global_id,
+                                   method=args.template_normalization_method)
+            )
+            template_params = bank.table[global_id]
+
+            # Fine-template sigmasq per ifo from the coarse reference sigmasq.
+            sigmasq = {
+                ifo: ref_cache[(0, ifo)][2] * sig_rescale ** 2
+                for ifo in args.instruments
+            }
+            sigma = {ifo: np.sqrt(sigmasq[ifo]) for ifo in args.instruments}
+            event_mgr.new_template(tmplt=template_params, sigmasq=sigmasq)
+
+            for s_num in range(n_seg):
+                stilde = {ifo: segments[ifo][s_num] for ifo in args.instruments}
+                analyse_segment = True
+                for ifo in args.instruments:
+                    if not inj_filter_rejector[ifo].template_segment_checker(
+                        bank, global_id, stilde[ifo]
+                    ):
+                        analyse_segment = False
+                if not analyse_segment:
+                    continue
+
+                # Reconstruct per-detector complex SNR(t) for this fine template
+                snr_dict = dict.fromkeys(args.instruments)
+                idx = dict.fromkeys(args.instruments)
+                snr = dict.fromkeys(args.instruments)
+                wraparound_dict = dict.fromkeys(args.instruments)
+                for ifo in args.instruments:
+                    ref_arr, bcache, _ = ref_cache[(s_num, ifo)]
+                    series = engines[ifo].fine_snr_timeseries(
+                        filt, n_taps_group, stilde[ifo].analyze,
+                        ref_snr=ref_arr, block_cache=bcache
+                    )
+                    # Fine-template normalized complex SNR over the analyze slice
+                    snr_full = series[stilde[ifo].analyze] / snr_rescale
+                    snr_dict[ifo] = snr_full
+                    wraparound_dict[ifo] = len(snr_full)
+                    assert wraparound_dict[ifo] > 0, \
+                        f'SNR time series for {ifo} is empty'
+                    ind = np.flatnonzero(
+                        np.abs(snr_full) > args.sngl_snr_threshold
+                    ).astype(np.int32)
+                    idx[ifo] = ind
+                    snr[ifo] = snr_full[ind]
+
+                n_trigs = [len(snr[ifo]) for ifo in args.instruments]
+                if not any(n_trigs):
+                    continue
+
+                # ===========================================================
+                # Coherent statistic (unchanged from pycbc_multi_inspiral).
+                # ===========================================================
+                for slide in range(num_slides):
+                    for position_index in range(len(sky_positions)):
+                        idx_dict = {
+                            ifo: idx[ifo][
+                                np.logical_and(
+                                    idx[ifo]
+                                    > time_delay_idx[0][position_index][ifo],
+                                    idx[ifo]
+                                    < time_delay_idx[0][position_index][ifo]
+                                    + wraparound_dict[ifo],
+                                )
+                            ]
+                            for ifo in args.instruments
+                        }
+                        coinc_idx = coh.get_coinc_indexes(
+                            idx_dict, time_delay_idx[slide][position_index],
+                            args.nifo_sngl_snr_threshold, wraparound_dict
+                        )
+                        coinc_idx_det_frame = {
+                            ifo: (coinc_idx
+                                  + time_delay_idx[slide][position_index][ifo])
+                            % wraparound_dict[ifo]
+                            for ifo in args.instruments
+                        }
+                        if len(coinc_idx) != 0:
+                            (rho_coinc, coinc_idx,
+                             coinc_triggers) = coh.coincident_snr(
+                                snr_dict, coinc_idx, args.coinc_threshold,
+                                time_delay_idx[slide][position_index],
+                            )
+                        else:
+                            coinc_triggers = {}
+                        if len(coinc_idx) != 0 and nifo > 1:
+                            fp = {
+                                ifo: antenna_pattern[ifo][position_index][0]
+                                for ifo in args.instruments
+                            }
+                            fc = {
+                                ifo: antenna_pattern[ifo][position_index][1]
+                                for ifo in args.instruments
+                            }
+                            if args.projection == 'left+right':
+                                project_l = coh.get_projection_matrix(
+                                    fp, fc, sigma, projection='left')
+                                (rho_coh_l, coinc_idx_l, coinc_triggers_l,
+                                 rho_coinc_l) = coh.coherent_snr(
+                                    coinc_triggers, coinc_idx, 0.0,
+                                    project_l, rho_coinc)
+                                project_r = coh.get_projection_matrix(
+                                    fp, fc, sigma, projection='right')
+                                (rho_coh_r, coinc_idx_r, coinc_triggers_r,
+                                 rho_coinc_r) = coh.coherent_snr(
+                                    coinc_triggers, coinc_idx, 0.0,
+                                    project_r, rho_coinc)
+                                l_above = rho_coh_l > args.coinc_threshold
+                                r_above = rho_coh_r > args.coinc_threshold
+                                lr_above = l_above & r_above
+                                rho_coh_l = rho_coh_l[lr_above]
+                                rho_coh_r = rho_coh_r[lr_above]
+                                coinc_idx_l = coinc_idx_l[lr_above]
+                                coinc_idx_r = coinc_idx_r[lr_above]
+                                for ifo in coinc_triggers_l.keys():
+                                    coinc_triggers_l[ifo] = \
+                                        coinc_triggers_l[ifo][lr_above]
+                                for ifo in coinc_triggers_r.keys():
+                                    coinc_triggers_r[ifo] = \
+                                        coinc_triggers_r[ifo][lr_above]
+                                rho_coinc_l = rho_coinc_l[lr_above]
+                                rho_coinc_r = rho_coinc_r[lr_above]
+                                max_idx = np.argmax(
+                                    [rho_coh_l, rho_coh_r], axis=0)
+                                rho_coh = np.where(
+                                    max_idx == 0, rho_coh_l, rho_coh_r)
+                                coinc_idx = np.where(
+                                    max_idx == 0, coinc_idx_l, coinc_idx_r)
+                                coinc_triggers = {
+                                    ifo: np.where(
+                                        max_idx == 0,
+                                        coinc_triggers_l[ifo],
+                                        coinc_triggers_r[ifo])
+                                    for ifo in coinc_triggers_l
+                                }
+                                rho_coinc = np.where(
+                                    max_idx == 0, rho_coinc_l, rho_coinc_r)
+                            else:
+                                project = coh.get_projection_matrix(
+                                    fp, fc, sigma, projection=args.projection)
+                                (rho_coh, coinc_idx, coinc_triggers,
+                                 rho_coinc) = coh.coherent_snr(
+                                    coinc_triggers, coinc_idx,
+                                    args.coinc_threshold, project, rho_coinc)
+                            if len(coinc_idx) != 0:
+                                (null, rho_coh, rho_coinc, coinc_idx,
+                                 coinc_triggers) = coh.null_snr(
+                                    rho_coh, rho_coinc,
+                                    apply_cut=args.do_null_cut,
+                                    null_min=args.null_min,
+                                    null_grad=args.null_grad,
+                                    null_step=args.null_step,
+                                    snrv=coinc_triggers, index=coinc_idx)
+                        if len(coinc_idx) != 0:
+                            coinc_idx_det_frame = {
+                                ifo: (coinc_idx
+                                      + time_delay_idx[slide][position_index][ifo])
+                                % wraparound_dict[ifo]
+                                for ifo in args.instruments
+                            }
+                            coherent_ifo_trigs = {
+                                ifo: snr_dict[ifo][coinc_idx_det_frame[ifo]]
+                                for ifo in args.instruments
+                            }
+                            num_events = (
+                                len(coinc_idx) if nifo == 1 else len(rho_coh)
+                            )
+                            # Phase 1: chi-square vetoes stubbed to zero.
+                            chisq = {
+                                ifo: np.zeros(num_events, dtype=np.float32)
+                                for ifo in args.instruments
+                            }
+                            chisq_dof = {
+                                ifo: np.ones(num_events, dtype=np.int32)
+                                for ifo in args.instruments
+                            }
+                            network_chisq_dict = coh.network_chisq(
+                                chisq, chisq_dof, coherent_ifo_trigs)
+                            if nifo > 1:
+                                reweighted_snr = ranking.newsnr(
+                                    rho_coh, network_chisq_dict,
+                                    q=args.chisq_index, n=args.chisq_nhigh)
+                                reweighted_snr = coh.reweight_snr_by_null(
+                                    reweighted_snr, null, rho_coh,
+                                    null_min=args.null_min,
+                                    null_grad=args.null_grad,
+                                    null_step=args.null_step)
+                            else:
+                                rho_sngl = abs(
+                                    snr_dict[args.instruments[0]][
+                                        coinc_idx_det_frame[args.instruments[0]]
+                                    ])
+                                reweighted_snr = ranking.newsnr(
+                                    rho_sngl, network_chisq_dict,
+                                    q=args.chisq_index, n=args.chisq_nhigh)
+                            for ifo in args.instruments:
+                                ifo_out_vals['bank_chisq'] = np.zeros(
+                                    num_events, dtype=np.float32)
+                                ifo_out_vals['bank_chisq_dof'] = np.ones(
+                                    num_events, dtype=np.int32)
+                                ifo_out_vals['auto_chisq'] = np.zeros(
+                                    num_events, dtype=np.float32)
+                                ifo_out_vals['auto_chisq_dof'] = np.ones(
+                                    num_events, dtype=np.int32)
+                                ifo_out_vals['chisq'] = chisq[ifo]
+                                ifo_out_vals['chisq_dof'] = chisq_dof[ifo]
+                                ifo_out_vals['time_index'] = (
+                                    coinc_idx_det_frame[ifo]
+                                    + stilde[ifo].cumulative_index)
+                                ifo_out_vals['snr'] = coherent_ifo_trigs[ifo]
+                                ifo_out_vals['ifo'] = [
+                                    event_mgr.ifo_dict[ifo]] * num_events
+                                ifo_out_vals['slide_id'] = [slide] * num_events
+                                event_mgr.add_template_events_to_ifo(
+                                    ifo, ifo_names,
+                                    [ifo_out_vals[n] for n in ifo_names])
+                            if nifo > 1:
+                                network_out_vals['coherent_snr'] = rho_coh
+                                network_out_vals['null_snr'] = null
+                            else:
+                                network_out_vals['coherent_snr'] = abs(
+                                    snr_dict[args.instruments[0]][
+                                        coinc_idx_det_frame[args.instruments[0]]
+                                    ])
+                            network_out_vals['reweighted_snr'] = reweighted_snr
+                            network_out_vals['my_network_chisq'] = np.real(
+                                network_chisq_dict)
+                            network_out_vals['time_index'] = (
+                                coinc_idx
+                                + stilde[args.instruments[0]].cumulative_index)
+                            network_out_vals['nifo'] = [nifo] * num_events
+                            network_out_vals['dec'] = [
+                                sky_positions.decs[position_index]
+                            ] * num_events
+                            network_out_vals['ra'] = [
+                                sky_positions.ras[position_index]
+                            ] * num_events
+                            network_out_vals['slide_id'] = [slide] * num_events
+                            event_mgr.add_template_events_to_network(
+                                network_names,
+                                [network_out_vals[n] for n in network_names])
+
+                # Cluster this fine template's events (per slide).
+                if args.cluster_method == "window":
+                    cluster_window = int(args.cluster_window * sample_rate)
+                elif args.cluster_method == "template":
+                    cluster_window = int(
+                        template_params.chirp_length * sample_rate)
+                for slide in range(num_slides):
+                    event_mgr.cluster_template_network_events(
+                        'time_index', 'reweighted_snr', cluster_window,
+                        slide=slide)
+            event_mgr.finalize_template_events()
+    logging.info("Filtering completed")
+
+time_stop = time.time()
+run_time = time_stop - time_init
+event_mgr.save_performance(
+    num_cpu_cores, len(segments[args.instruments[0]]),
+    len(bank.table), run_time, time_setup
+)
+logging.info("Writing output")
+event_mgr.write_events(args.output)
+logging.info("Finished")
+logging.info("Time to complete analysis: %.0f s", time.time() - time_init)
