@@ -25,6 +25,12 @@ Suites:
      scheme this becomes a CPU-vs-CUDA parity check of the engine (Phase 2).
   C. Tap fidelity: if a ratio bank is available (env MIFIR_DIR), every fine
      template's stored filter_match is >= 0.99.
+  E. --high-frequency-cutoff consistency: the reference SNR normalization
+     integrates the same band as the filter integral (regression test).
+  F. Even-tap centering: a delta tap at the pycbc_fir_bank design center
+     (K-1)//2 is the identity filter, single-rate AND under decimation
+     (regression test for the K//2 roll that shifted even-count filters by
+     one tap-rate sample -- a half engine sample at decimation 2).
 
 Suites B (FIR-vs-brute correctness) and D (throughput) are driven end-to-end
 on a compute node by test/multi_inspiral_fir/run_validation.sbatch, which runs
@@ -139,6 +145,68 @@ class TestRatioEngineSNRSeries(unittest.TestCase):
                         "block-FFT cache reuse changed the result")
 
 
+class TestEvenTapCentering(unittest.TestCase):
+    """Suite F: even tap counts must use the pycbc_fir_bank centering.
+
+    pycbc_fir_bank designs tap j at time j - (K-1)//2 for BOTH parities
+    (even K spans -K/2+1 .. K/2). So a tap vector that is 1.0 at index
+    (K-1)//2 and zero elsewhere is exactly the identity filter: the
+    reconstructed series must equal the reference series. Regression test
+    for the engine rolling by K//2, which shifted every even-count filter
+    by one tap-rate sample (an envelope-sampling half engine sample under
+    decimation 2 -- the 1.5% loss seen in the multi-rate even-tap
+    validation).
+
+    The reference is built block-analytic (upper half spectrum zero) so the
+    engine's analytic multiply is transparent to the comparison.
+    """
+
+    N_FFT = 4096
+
+    def setUp(self):
+        np.random.seed(2027)
+        spec = np.zeros(self.N_FFT, dtype=np.complex64)
+        nhalf = self.N_FFT // 2
+        spec[:nhalf] = (np.random.randn(nhalf)
+                        + 1j * np.random.randn(nhalf))
+        self.ref = np.fft.ifft(spec).astype(np.complex64)
+        self.valid = slice(400, 3600)
+
+    def _delta_series(self, n_taps, tap_sr, engine_sr):
+        eng = RatioMatchedFilterControl(
+            snr_threshold=3.0, delta_f=1.0 / 256,
+            fir_fft_length=self.N_FFT, batch_size=8,
+            tap_sample_rate=tap_sr, engine_sample_rate=engine_sr)
+        taps = np.zeros((1, n_taps), dtype=np.float32)
+        taps[0, (n_taps - 1) // 2] = 1.0   # the design-center tap (t = 0)
+        counts = np.array([n_taps], dtype=np.int32)
+        filters_f, _ = eng.prepare_filters(taps, counts)
+        return eng.fine_snr_timeseries(filters_f[0], n_taps, self.valid,
+                                       ref_snr=self.ref, block_cache={})
+
+    def _check_identity(self, out, label):
+        scale = np.abs(self.ref).max()
+        err = np.abs(out[self.valid] - self.ref[self.valid]).max() / scale
+        self.assertLess(err, 1e-4,
+                        f"{label}: delta tap at (K-1)//2 is not the identity "
+                        f"filter (max rel err {err:.3e}) -- even-tap "
+                        "centering is off")
+
+    def test_even_taps_single_rate(self):
+        self._check_identity(self._delta_series(150, 2048, 2048),
+                             "K=150, decimate=1")
+
+    def test_even_taps_multirate(self):
+        self._check_identity(self._delta_series(300, 4096, 2048),
+                             "K=300, decimate=2")
+
+    def test_odd_taps_unchanged(self):
+        self._check_identity(self._delta_series(151, 2048, 2048),
+                             "K=151, decimate=1")
+        self._check_identity(self._delta_series(301, 4096, 2048),
+                             "K=301, decimate=2")
+
+
 class TestFIRvsBruteMatchedFilter(unittest.TestCase):
     """The new FIR reconstruction of a fine template's complex SNR(t) must
     reproduce pycbc's existing brute-force matched filter of that same fine
@@ -174,12 +242,17 @@ class TestFIRvsBruteMatchedFilter(unittest.TestCase):
         bank = RatioFilterBank(path, flen, delta_f, np.complex64,
                                low_frequency_cutoff=flow, phase_order='-1',
                                approximant='TaylorF2')
-        # A flat (unit) PSD: well-conditioned (the bank templates are O(1) and
-        # carry no DYN_RANGE scaling, so a realistic ~1e-47 PSD would overflow
-        # float32 sigmasq) and faithful -- the FIR reconstruction reproduces
-        # matched_filter(fine) for ANY PSD (the coarse template cancels exactly;
-        # the taps encode the PSD-independent ratio h_fine/h_coarse), so the
-        # PSD scale cancels in the FIR-vs-brute ratio.
+        # A flat (unit) PSD, used identically by BOTH the brute and FIR matched
+        # filters here. Rationale: (1) conditioning -- the bank templates are
+        # O(1) with no DYN_RANGE scaling, so a realistic ~1e-47 PSD overflows
+        # float32 sigmasq; (2) validity -- for whatever PSD both sides use, the
+        # FIR reconstruction equals matched_filter(fine) because the coarse
+        # template cancels analytically (fft(MF(coarse))*conj(taps) ~
+        # conj(h_fine)*data/psd) and the taps approximate h_fine/h_coarse. This
+        # does NOT claim the SNR is PSD-independent; it claims a flat PSD is a
+        # legitimate common choice for the FIR-vs-brute comparison. The residual
+        # is the tap mismatch (~1 - filter_match), which is why we pick the
+        # best-matched fine template below to keep the bound tight.
         psd = FrequencySeries(np.ones(flen, dtype=np.float32), delta_f=delta_f)
         coarse_idx = int(bank.coarse_indices[0])
         coarse = bank.get_coarse_template(coarse_idx)
@@ -242,14 +315,98 @@ class TestFIRvsBruteMatchedFilter(unittest.TestCase):
         self.assertLess(abs(ratio - 1.0), 0.02,
                         f"FIR vs brute matched-filter peak off by "
                         f"{abs(ratio-1)*100:.2f}%")
-        # Also: the FIR SNR series should track brute in the interior (the
-        # complex waveform shapes agree, not just the peak).
-        bt = np.argmax(np.abs(brute))
-        # align on the brute peak time; compare complex values there
-        cval_ratio = abs(fir[bt]) / abs(brute[bt])
-        print(f"  at brute peak t={bt}: |fir|/|brute| = {cval_ratio:.5f}")
-        self.assertLess(abs(cval_ratio - 1.0), 0.05,
-                        "FIR SNR at the brute peak time disagrees")
+        # Complex (magnitude AND phase) agreement at the peak: the coherent
+        # combination uses the complex SNR, so phase must match too. Compare
+        # the complex residual, and the phase explicitly.
+        bt = int(np.argmax(np.abs(brute)))
+        complex_relerr = abs(fir[bt] - brute[bt]) / abs(brute[bt])
+        phase_diff = abs(np.angle(fir[bt] / brute[bt]))
+        print(f"  at brute peak t={bt}: complex rel err = {complex_relerr:.5f}, "
+              f"phase diff = {phase_diff:.2e} rad")
+        self.assertLess(complex_relerr, 0.02,
+                        "FIR complex SNR at the brute peak disagrees (mag/phase)")
+        self.assertLess(phase_diff, 0.05,
+                        f"FIR SNR phase at the brute peak off by {phase_diff:.3f} rad")
+
+
+class TestReferenceCutoffNormalization(unittest.TestCase):
+    """Suite E: --high-frequency-cutoff consistency of the reference SNR.
+
+    Regression test: compute_reference_snr used the cached *full-band*
+    template sigmasq as h_norm while handing matched_filter_core
+    high_frequency_cutoff=f_high, so every SNR came out low by
+    sqrt(sigmasq_full / sigmasq_band) (~5.5% on the validation bank at
+    f_high=256 Hz). The normalization must integrate exactly the band the
+    filter integrates.
+
+    Self-contained (no ratio bank): a synthetic f^{-7/6} template on a unit
+    PSD, with the data segment equal to the template, has matched-filter
+    peak |SNR| == sigma over the filtered band, for ANY cutoff.
+    """
+
+    def setUp(self):
+        from pycbc.types import FrequencySeries
+        self.sample_rate = 2048
+        tlen = 8192
+        self.delta_t = 1.0 / self.sample_rate
+        self.delta_f = self.sample_rate / float(tlen)
+        flen = tlen // 2 + 1
+        self.flow = 30.0
+        f = np.arange(flen) * self.delta_f
+        amp = np.zeros(flen)
+        band = (f >= self.flow) & (f <= 900.0)
+        amp[band] = (f[band] / 100.0) ** (-7.0 / 6.0)
+        htilde = FrequencySeries(amp.astype(np.complex64),
+                                 delta_f=self.delta_f)
+        htilde.f_lower = self.flow  # engine reads this for the low cutoff
+        self.htilde = htilde
+        # data = the template itself -> peak SNR = sigma of the filtered band
+        self.stilde = FrequencySeries(amp.astype(np.complex64),
+                                      delta_f=self.delta_f)
+        self.psd = FrequencySeries(np.ones(flen, dtype=np.float32),
+                                   delta_f=self.delta_f)
+
+    def _engine(self, f_high):
+        return RatioMatchedFilterControl(
+            snr_threshold=4.0, delta_f=self.delta_f, fir_fft_length=4096,
+            batch_size=8, tap_sample_rate=self.sample_rate,
+            engine_sample_rate=self.sample_rate,
+            high_frequency_cutoff=f_high)
+
+    def test_h_norm_honors_cutoff(self):
+        from pycbc.filter.matchedfilter import sigmasq
+        f_cut = 128.0
+        expected = float(sigmasq(self.htilde, psd=self.psd,
+                                 low_frequency_cutoff=self.flow,
+                                 high_frequency_cutoff=f_cut))
+        full = float(sigmasq(self.htilde, psd=self.psd,
+                             low_frequency_cutoff=self.flow))
+        # The test is vacuous unless the cutoff removes real in-band power.
+        self.assertLess(expected, 0.95 * full)
+        eng = self._engine(f_cut)
+        h_norm = eng.compute_reference_snr(self.stilde, self.psd, self.htilde)
+        self.assertAlmostEqual(
+            h_norm / expected, 1.0, places=5,
+            msg="h_norm does not integrate [f_lower, f_high]")
+
+    def test_reference_snr_peak_is_band_sigma(self):
+        """The engine's ref_snr carries an extra delta_t (and 1/decimate,
+        = 1 here) factor; after removing it the peak must equal the band
+        sigma. With the old bug the peak is low by sqrt(band/full): 7.0%
+        at f_high=128 Hz and 2.4% at 256 Hz for this template -- both far
+        above the 0.1% gate."""
+        from pycbc.filter.matchedfilter import sigmasq
+        for f_cut in (128.0, 256.0):
+            eng = self._engine(f_cut)
+            eng.compute_reference_snr(self.stilde, self.psd, self.htilde)
+            sigma_band = np.sqrt(float(sigmasq(
+                self.htilde, psd=self.psd, low_frequency_cutoff=self.flow,
+                high_frequency_cutoff=f_cut)))
+            peak = np.abs(eng.ref_snr).max() / self.delta_t
+            self.assertLess(
+                abs(peak / sigma_band - 1.0), 1e-3,
+                f"f_high={f_cut}: peak SNR {peak:.3f} != band sigma "
+                f"{sigma_band:.3f} (filter/normalization band mismatch)")
 
 
 class TestTapFidelity(unittest.TestCase):
@@ -275,7 +432,9 @@ if __name__ == '__main__':
     suite = unittest.TestSuite()
     loader = unittest.TestLoader()
     suite.addTest(loader.loadTestsFromTestCase(TestRatioEngineSNRSeries))
+    suite.addTest(loader.loadTestsFromTestCase(TestEvenTapCentering))
     suite.addTest(loader.loadTestsFromTestCase(TestFIRvsBruteMatchedFilter))
+    suite.addTest(loader.loadTestsFromTestCase(TestReferenceCutoffNormalization))
     suite.addTest(loader.loadTestsFromTestCase(TestTapFidelity))
     results = unittest.TextTestRunner(verbosity=2).run(suite)
     simple_exit(results)

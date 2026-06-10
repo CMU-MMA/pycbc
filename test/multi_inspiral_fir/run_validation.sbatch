@@ -82,26 +82,29 @@ COMMON_ARGS="--instruments H1 L1 --projection standard \
   --sngl-snr-threshold 3.0 --nifo-sngl-snr-threshold 2 --coinc-threshold 0.0 \
   --cluster-method window --cluster-window 0.1 --processing-scheme cpu"
 
+# Track failures across all steps; the job exits nonzero (Slurm FAILED) if any
+# executable crashes or any gate fails. We do NOT use `set -e` so that all
+# results are printed even when an early step fails, but `rc` is the verdict.
+rc=0
+
 # --- 3. Brute-force baseline ---
 echo ">> [$(date +%T)] Brute pycbc_multi_inspiral"
 python3 ${REPO}/bin/pycbc_multi_inspiral $COMMON_ARGS \
     --bank-file ${D}/fine_bank.hdf --chisq-bins 16 \
-    --output ${D}/brute_triggers.hdf
-echo ">> [$(date +%T)] brute done"
+    --output ${D}/brute_triggers.hdf || { echo "ERROR: brute run failed"; rc=1; }
 
 # --- 4. FIR coherent search ---
 echo ">> [$(date +%T)] FIR pycbc_multi_inspiral_fir"
 python3 ${REPO}/bin/pycbc_multi_inspiral_fir $COMMON_ARGS \
     --bank-file ${D}/ratio_bank.hdf \
     --fir-length 4096 --batch-size 64 \
-    --template-normalization-method precalculated_sigma \
-    --output ${D}/fir_triggers.hdf
-echo ">> [$(date +%T)] fir done"
+    --output ${D}/fir_triggers.hdf || { echo "ERROR: FIR run failed"; rc=1; }
 
 # --- 5. Compare (gate) ---
 echo ">> [$(date +%T)] Comparing FIR vs brute"
 python3 ${HERE}/compare_triggers.py \
     --brute ${D}/brute_triggers.hdf --fir ${D}/fir_triggers.hdf \
-    --tolerance 0.02 || echo "(compare returned nonzero — see verdict above)"
+    --tolerance 0.02 || { echo "GATE FAILED"; rc=1; }
 
-echo "================ done: $(date) ================"
+echo "================ done: $(date)  (exit ${rc}) ================"
+exit ${rc}

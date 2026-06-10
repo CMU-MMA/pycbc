@@ -4,7 +4,7 @@ import scipy.fft as _scipy_fft
 import pycbc.fft
 import pycbc.scheme
 from pycbc.types import zeros, complex64, Array
-from pycbc.filter.matchedfilter import matched_filter_core
+from pycbc.filter.matchedfilter import matched_filter_core, sigmasq
 from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython, find_peaks_in_block_cython
 
 
@@ -202,9 +202,20 @@ class RatioMatchedFilterControl(object):
         Returns
         -------
         h_norm : float
-            The reference template's sigmasq (``<h_ref|h_ref>``).
+            The reference template's sigmasq (``<h_ref|h_ref>``) over the
+            filter band ``[f_lower, f_high]``.
         """
-        h_norm = ref_template.sigmasq(psd)
+        if self.f_high is None:
+            h_norm = ref_template.sigmasq(psd)
+        else:
+            # The filter integral below stops at f_high, so the normalization
+            # must integrate the same band: the cached template sigmasq is
+            # full-band and would overestimate h_norm, deflating every SNR by
+            # sqrt(sigmasq_full / sigmasq_band).
+            h_norm = float(sigmasq(
+                ref_template, psd=psd,
+                low_frequency_cutoff=ref_template.f_lower,
+                high_frequency_cutoff=self.f_high))
         snr, _, norm = matched_filter_core(
             ref_template, stilde, psd=psd,
             low_frequency_cutoff=ref_template.f_lower,
@@ -292,7 +303,7 @@ class RatioMatchedFilterControl(object):
         n_taps_max = int(n_taps_eff)
 
         N_VALID = N_FFT - n_taps_max + 1
-        bad_start = n_taps_max // 2
+        bad_start = n_taps_max // 2  # filter support is -(n-1)//2 .. n//2 around the t=0 tap (n-1)//2, for odd AND even n
 
         if valid_slice is not None:
             v_start = valid_slice.start
@@ -310,7 +321,10 @@ class RatioMatchedFilterControl(object):
         corr = np.zeros((1, N_FFT), dtype=complex64)
 
         first_block_idx = (v_start - bad_start) // N_VALID
-        loop_start = first_block_idx * N_VALID
+        # Clamp to 0 so a small analyze.start (v_start < bad_start) can't make
+        # the first block start negative (which would index ref_snr with a
+        # negative t_start). Mirrors the CUDA path.
+        loop_start = max(0, first_block_idx * N_VALID)
         for t_start in range(loop_start, n_samples, N_VALID):
             block_valid_t0 = t_start + bad_start
             if block_valid_t0 >= v_stop:
@@ -356,7 +370,7 @@ class RatioMatchedFilterControl(object):
         n_samples = len(ref_snr)
         n_taps_max = int(n_taps_eff)
         N_VALID = N_FFT - n_taps_max + 1
-        bad_start = n_taps_max // 2
+        bad_start = n_taps_max // 2  # filter support is -(n-1)//2 .. n//2 around the t=0 tap (n-1)//2, for odd AND even n
         if valid_slice is not None:
             v_start = valid_slice.start
             v_stop = valid_slice.stop
@@ -380,6 +394,11 @@ class RatioMatchedFilterControl(object):
                     t_starts.append(ts)
                 ts += N_VALID
             n_blocks = len(t_starts)
+            if n_blocks == 0:
+                # Degenerate/empty valid region: return zeros (matches the CPU
+                # path, whose block loop simply doesn't execute). Avoids a
+                # batch-0 cufft plan and the t_starts[0] dereference below.
+                return np.zeros(n_samples, dtype=complex64)
             block_in = np.zeros(n_blocks * N_FFT, dtype=np.complex64)
             for b, ts in enumerate(t_starts):
                 te = min(ts + N_FFT, n_samples)
@@ -456,7 +475,14 @@ class RatioMatchedFilterControl(object):
             
             # 3. Handle Variable Time-Domain Roll Logic at the native 2048 Hz rate
             current_counts = counts[start:end]
-            roll_offsets = -(current_counts // 2)
+            # pycbc_fir_bank designs tap j at time j - (K-1)//2 for BOTH odd
+            # and even K (even K spans -K/2+1 .. K/2), so (K-1)//2 is the tap
+            # that belongs at t=0. Rolling by K//2 (one tap too many for even
+            # K) shifts the filter by a full tap-rate sample: invisible at
+            # decimation 1 (integer engine-sample translation) but a
+            # *fractional* engine-sample shift under decimation, which
+            # samples the SNR envelope off-peak (~1.5% loss at decimation 2).
+            roll_offsets = -((current_counts - 1) // 2)
             
             cols_high = np.arange(high_res_fft_len)
             rows = np.arange(batch_len)[:, None]
@@ -520,11 +546,11 @@ class RatioMatchedFilterControl(object):
             
             N_VALID = N_FFT - n_taps_max + 1
             STEP = N_VALID
-            bad_start = n_taps_max // 2
+            bad_start = n_taps_max // 2  # filter support is -(n-1)//2 .. n//2 around the t=0 tap (n-1)//2, for odd AND even n
 
             # Determine Loop Bounds
             first_block_idx = (v_start - bad_start) // STEP
-            loop_start = first_block_idx * STEP
+            loop_start = max(0, first_block_idx * STEP)
 
             for t_start in range(loop_start, n_samples, STEP):
 

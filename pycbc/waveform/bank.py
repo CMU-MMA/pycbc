@@ -1198,7 +1198,11 @@ class RatioFilterBank(FilterBank):
             indices_unique= np.unique(indices_combined)
             self.coarse_indices = indices_unique
         else:
-            self.coarse_indices = []
+            # Keep an ndarray (not a Python list) so a subsequent
+            # template_thinning call (e.g. once per detector) and downstream
+            # ndarray indexing/iteration stay well-defined when no coarse
+            # reference falls within the thinning window.
+            self.coarse_indices = np.array([], dtype=int)
 
     def get_coarse_template(self, coarse_index):
         """Wrapper to get the frequency-domain waveform from the internal coarse bank.
@@ -1297,10 +1301,15 @@ class RatioFilterBank(FilterBank):
 
         tlen = int(self.sample_rate / delta_f)
         ts = np.zeros(tlen)
-        start = size // 2
+        # pycbc_fir_bank designs tap j at time j - (size-1)//2 for both odd
+        # and even tap counts, so tap (size-1)//2 belongs at t=0 (the same
+        # centering the FIR engine's roll uses in
+        # matched_ratio._fft_all_filters).
+        start = (int(size) - 1) // 2
         end = len(taps) - start
         ts[:end] = taps[-end:]
-        ts[-start:] = taps[:start]
+        if start > 0:
+            ts[-start:] = taps[:start]
         ts = TimeSeries(ts, delta_t=1.0/self.sample_rate)
         fs = ts.to_frequencyseries().astype(self.dtype)
         fs.params = self.table[fine_index]

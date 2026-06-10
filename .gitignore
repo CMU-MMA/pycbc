@@ -1,4 +1,5 @@
 *.~
+.claude/
 *.so
 .DS_Store
 *.log

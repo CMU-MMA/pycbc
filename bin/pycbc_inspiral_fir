@@ -179,7 +179,11 @@ def get_args():
     # --- Ratio Specific ---
     group = parser.add_argument_group("Ratio Filter Options")
     group.add_argument('--high-frequency-cutoff', type=float,
-                       help="High frequency cutoff (defaults to Nyquist).")
+                       help="High frequency cutoff (defaults to Nyquist). "
+                            "Both the reference filter integral and its "
+                            "normalization honor this cutoff; fine-template "
+                            "rescaling still uses the bank's stored "
+                            "full-band sigma ratios.")
     group.add_argument('--batch-size', type=int, default=64,
                        help="Number of filters to process in one FFT batch.")
     group.add_argument('--fir-length', type=int, default=4096,

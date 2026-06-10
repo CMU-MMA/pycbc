@@ -67,26 +67,33 @@ COMMON_ARGS="--instruments H1 L1 --projection standard \
 FIR_ARGS="--bank-file ${D}/ratio_bank.hdf --fir-length 4096 --batch-size 64 \
   --template-normalization-method precalculated_sigma"
 
+# rc accumulates failures; job exits nonzero (Slurm FAILED) if any step fails.
+rc=0
+
 echo ">> [$(date +%T)] Brute (cpu)"
 python3 ${REPO}/bin/pycbc_multi_inspiral $COMMON_ARGS --processing-scheme cpu \
-    --bank-file ${D}/fine_bank.hdf --chisq-bins 16 --output ${D}/brute_triggers.hdf
+    --bank-file ${D}/fine_bank.hdf --chisq-bins 16 --output ${D}/brute_triggers.hdf \
+    || { echo "ERROR: brute run failed"; rc=1; }
 
 echo ">> [$(date +%T)] FIR (cpu)"
 python3 ${REPO}/bin/pycbc_multi_inspiral_fir $COMMON_ARGS --processing-scheme cpu \
-    $FIR_ARGS --output ${D}/fir_cpu_triggers.hdf
+    $FIR_ARGS --output ${D}/fir_cpu_triggers.hdf \
+    || { echo "ERROR: FIR-cpu run failed"; rc=1; }
 
 echo ">> [$(date +%T)] FIR (cuda)"
 python3 ${REPO}/bin/pycbc_multi_inspiral_fir $COMMON_ARGS --processing-scheme cuda \
-    $FIR_ARGS --output ${D}/fir_cuda_triggers.hdf
+    $FIR_ARGS --output ${D}/fir_cuda_triggers.hdf \
+    || { echo "ERROR: FIR-cuda run failed"; rc=1; }
 
 echo ">> [$(date +%T)] ===== GATE: FIR-CUDA vs brute ====="
 python3 ${HERE}/compare_triggers.py --brute ${D}/brute_triggers.hdf \
     --fir ${D}/fir_cuda_triggers.hdf --tolerance 0.02 --report-snr 15 \
-    || echo "(gate compare returned nonzero)"
+    || { echo "GATE FAILED (FIR-CUDA vs brute)"; rc=1; }
 
 echo ">> [$(date +%T)] ===== PARITY: FIR-CUDA vs FIR-CPU (tight) ====="
 python3 ${HERE}/compare_triggers.py --brute ${D}/fir_cpu_triggers.hdf \
     --fir ${D}/fir_cuda_triggers.hdf --tolerance 0.001 --report-snr 15 \
-    || echo "(parity compare returned nonzero)"
+    || { echo "PARITY FAILED (FIR-CUDA vs FIR-CPU)"; rc=1; }
 
-echo "================ done: $(date) ================"
+echo "================ done: $(date)  (exit ${rc}) ================"
+exit ${rc}

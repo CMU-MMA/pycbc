@@ -167,12 +167,24 @@ fir_group.add_argument("--batch-size", type=int, default=64,
                        help="Number of FIR filters processed per FFT batch.")
 fir_group.add_argument("--high-frequency-cutoff", type=float,
                        help="High frequency cutoff for the reference matched "
-                            "filter (defaults to Nyquist).")
+                            "filter (defaults to Nyquist). Both the filter "
+                            "integral and the reference normalization honor "
+                            "this cutoff; the fine-template rescaling still "
+                            "uses the bank's stored full-band sigma ratios "
+                            "(a second-order approximation when the cutoff "
+                            "removes in-band template power). Note the brute "
+                            "pycbc_multi_inspiral has no such option, so "
+                            "cutoff runs cannot be validated against it.")
 fir_group.add_argument("--template-normalization-method",
                        choices=('precalculated_sigma', 'mchirp'),
-                       default='mchirp',
+                       default='precalculated_sigma',
                        help="Method to normalize fine templates relative to "
-                            "their coarse reference (default: mchirp).")
+                            "their coarse reference. 'precalculated_sigma' "
+                            "(default) uses the bank's stored per-template "
+                            "sigma ratios and is the validated-accurate path; "
+                            "'mchirp' is an analytic approximation (a few %% "
+                            "off on templates far from their coarse reference) "
+                            "for banks without stored sigmas.")
 fir_group.add_argument("--fft-workers", type=int, default=None,
                        help="Number of threads for the CPU (scipy) batched "
                             "FFTs in the FIR engine.")
@@ -210,6 +222,20 @@ fft.verify_fft_options(args, parser)
 inj_filter_rejector = inject.InjFilterRejector.from_cli_multi_ifos(
     args, args.instruments
 )
+# pycbc_multi_inspiral trims per-detector triggers to injection windows via
+# InjFilterRejector.find_indices_in_injection_intervals. The FIR driver does
+# NOT implement that per-trigger cut, so rather than silently produce a
+# different (superset) trigger set, refuse the option outright.
+for _ifo in args.instruments:
+    if (inj_filter_rejector[_ifo].enabled and
+            getattr(inj_filter_rejector[_ifo], 'inj_trigger_window', None)):
+        parser.error(
+            "--injection-filter-rejector-trigger-window is not supported by "
+            "pycbc_multi_inspiral_fir: the per-trigger injection-window cut "
+            "that pycbc_multi_inspiral applies is not implemented in the FIR "
+            "path, so honoring it silently would diverge from brute force. "
+            "Remove the option (or implement the cut) to proceed."
+        )
 strain_dict = strain.from_cli_multi_ifos(
     args, args.instruments, inj_filter_rejector, dyn_range_fac=DYN_RANGE_FAC
 )
@@ -388,15 +414,26 @@ with ctx:
             template_params = bank.table[global_id]
 
             # Fine-template sigmasq per ifo from the coarse reference sigmasq.
+            # new_template (and the stored per-template sigmasq) uses segment 0,
+            # matching pycbc_multi_inspiral which calls new_template at s_num==0.
             sigmasq = {
                 ifo: ref_cache[(0, ifo)][2] * sig_rescale ** 2
                 for ifo in args.instruments
             }
-            sigma = {ifo: np.sqrt(sigmasq[ifo]) for ifo in args.instruments}
             event_mgr.new_template(tmplt=template_params, sigmasq=sigmasq)
 
             for s_num in range(n_seg):
                 stilde = {ifo: segments[ifo][s_num] for ifo in args.instruments}
+                # The antenna-pattern weights in the coherent projection use the
+                # sensitivity (sigma) of THIS segment -- the reference sigmasq is
+                # segment-dependent through the PSD, so sigma must be recomputed
+                # per segment (matching pycbc_multi_inspiral). Using a single
+                # per-template sigma would give the wrong projection/coherent SNR
+                # on real data with time-varying PSDs.
+                sigma = {
+                    ifo: np.sqrt(ref_cache[(s_num, ifo)][2] * sig_rescale ** 2)
+                    for ifo in args.instruments
+                }
                 analyse_segment = True
                 for ifo in args.instruments:
                     if not inj_filter_rejector[ifo].template_segment_checker(

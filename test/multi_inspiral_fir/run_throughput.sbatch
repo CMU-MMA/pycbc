@@ -73,22 +73,26 @@ FIR="--bank-file ${D}/ratio_bank.hdf --fir-length 4096 --batch-size 64 \
 
 run() { /usr/bin/time -v python3 "$@" 2>${D}/time.txt; grep -E "Elapsed|wall" ${D}/time.txt | head -1; }
 
+rc=0
 echo ">> [$(date +%T)] BRUTE (cpu)"
 T0=$SECONDS
 python3 ${REPO}/bin/pycbc_multi_inspiral $COMMON --processing-scheme cpu \
-    --bank-file ${D}/fine_bank.hdf --chisq-bins 16 --output ${D}/brute.hdf 2>${D}/brute_run.log
+    --bank-file ${D}/fine_bank.hdf --chisq-bins 16 --output ${D}/brute.hdf 2>${D}/brute_run.log \
+    || { echo "ERROR: brute run failed (see brute_run.log)"; rc=1; }
 TB=$((SECONDS-T0)); echo "   brute wall: ${TB}s"
 
 echo ">> [$(date +%T)] FIR (cpu)"
 T0=$SECONDS
 python3 ${REPO}/bin/pycbc_multi_inspiral_fir $COMMON --processing-scheme cpu \
-    $FIR --output ${D}/fir_cpu.hdf 2>${D}/fircpu_run.log
+    $FIR --output ${D}/fir_cpu.hdf 2>${D}/fircpu_run.log \
+    || { echo "ERROR: FIR-cpu run failed (see fircpu_run.log)"; rc=1; }
 TFC=$((SECONDS-T0)); echo "   FIR-cpu wall: ${TFC}s"
 
 echo ">> [$(date +%T)] FIR (cuda)"
 T0=$SECONDS
 python3 ${REPO}/bin/pycbc_multi_inspiral_fir $COMMON --processing-scheme cuda \
-    $FIR --output ${D}/fir_cuda.hdf 2>${D}/fircuda_run.log
+    $FIR --output ${D}/fir_cuda.hdf 2>${D}/fircuda_run.log \
+    || { echo "ERROR: FIR-cuda run failed (see fircuda_run.log)"; rc=1; }
 TFG=$((SECONDS-T0)); echo "   FIR-cuda wall: ${TFG}s"
 
 echo ">> ===== THROUGHPUT (${NFINE} fine templates, wall-clock incl. setup) ====="
@@ -103,8 +107,9 @@ PY
 
 echo ">> ===== GATE: FIR-CUDA vs brute ====="
 python3 ${HERE}/compare_triggers.py --brute ${D}/brute.hdf --fir ${D}/fir_cuda.hdf \
-    --tolerance 0.02 --report-snr 15 || echo "(gate nonzero)"
+    --tolerance 0.02 --report-snr 15 || { echo "GATE FAILED"; rc=1; }
 echo ">> ===== PARITY: FIR-CUDA vs FIR-CPU ====="
 python3 ${HERE}/compare_triggers.py --brute ${D}/fir_cpu.hdf --fir ${D}/fir_cuda.hdf \
-    --tolerance 0.001 --report-snr 15 || echo "(parity nonzero)"
-echo "================ done: $(date) ================"
+    --tolerance 0.001 --report-snr 15 || { echo "PARITY FAILED"; rc=1; }
+echo "================ done: $(date)  (exit ${rc}) ================"
+exit ${rc}
