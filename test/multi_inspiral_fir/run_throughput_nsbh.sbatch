@@ -47,9 +47,10 @@ SMP=/hildafs/projects/phy220048p/xhall/scratch/mifir/thru_smi_${SLURM_JOB_ID}.cs
 
 export MIFIR_PROFILE=1
 TILE=${MIFIR_TILE:-32}
+CW=${MIFIR_COARSE_WORKERS:-0}   # --fir-coarse-workers (0 = serial coarse gen)
 
 echo "================ node: $(hostname)  date: $(date) ================"
-echo "MIFIR_MAX_COARSE=${MIFIR_MAX_COARSE:-0} (0=full)  --fir-tile=${TILE}  MIFIR_FORCE_HOST=${MIFIR_FORCE_HOST:-0}"
+echo "MIFIR_MAX_COARSE=${MIFIR_MAX_COARSE:-0} (0=full)  --fir-tile=${TILE}  --fir-coarse-workers=${CW}  MIFIR_FORCE_HOST=${MIFIR_FORCE_HOST:-0}"
 nvidia-smi -L || true
 
 # Background nvidia-smi sampler (power, gpu/mem util, mem used) every 2 s.
@@ -79,6 +80,7 @@ python3 ${REPO}/bin/pycbc_multi_inspiral_fir \
     --cluster-method window --cluster-window 0.1 \
     --approximant TaylorF2 --order 7 \
     --fir-length 4096 --batch-size 64 --fir-tile ${TILE} \
+    --fir-coarse-workers ${CW} \
     --template-normalization-method precalculated_sigma \
     --processing-scheme cuda \
     --output "${OUT}" --verbose

@@ -272,6 +272,28 @@ strain_segments_dict = strain.StrainSegments.from_cli_multi_ifos(
     args, strain_dict, args.instruments
 )
 
+# --- Coarse-template generation worker pool (Phase 2) --------------------
+# Created HERE, before scheme.from_cli / the CUDA context: the workers are
+# forked (so they do NOT re-execute this script -- unlike 'spawn') from a
+# CUDA-free parent (so they never inherit a CUDA context, which fork cannot
+# safely duplicate). An eager multiprocessing.Pool forks all workers at
+# construction (not lazily), guaranteeing they predate CUDA initialization.
+# The workers open their own RatioFilterBank and generate the CPU TaylorF2
+# coarse references off the critical path, overlapped with GPU filtering.
+coarse_pool = None
+if args.fir_coarse_workers and args.fir_coarse_workers > 0:
+    import multiprocessing as _mp
+    _ifo0 = args.instruments[0]
+    _flen0 = strain_segments_dict[_ifo0].freq_len
+    _delta_f0 = strain_segments_dict[_ifo0].delta_f
+    _n_cw = int(args.fir_coarse_workers)
+    logging.info("Starting %d coarse-template generation worker(s) "
+                 "(fork, pre-CUDA)", _n_cw)
+    coarse_pool = _mp.get_context('fork').Pool(
+        _n_cw, initializer=coarse_gen_init,
+        initargs=(args.bank_file, _flen0, _delta_f0, 'complex64',
+                  args.low_frequency_cutoff, args.order, args.approximant))
+
 ctx = scheme.from_cli(args)
 # On CUDA the per-detector SNR series stays on the device: the threshold runs
 # on-device (events.threshold_only -> sparse triggers only) and the full series
@@ -748,37 +770,29 @@ with ctx:
         event_mgr.finalize_template_events()
 
     # --- Parallel coarse-template generation (Phase 2) -------------------
-    # Offload the CPU coarse-template generation to spawned worker processes
-    # (clean CPU, no CUDA context) and prefetch ahead of the main loop, so it
-    # overlaps with GPU filtering instead of stalling it serially. Workers
-    # produce bit-identical templates; results do not move.
+    # The CPU coarse generation is offloaded to a worker Pool (``coarse_pool``,
+    # created BEFORE the CUDA context so its forked workers are CUDA-free; see
+    # near scheme.from_cli) and prefetched ahead of the main loop, overlapping
+    # with GPU filtering instead of stalling it serially. Workers produce
+    # bit-identical templates; results do not move.
     coarse_list = [int(c) for c in bank.coarse_indices]
     if _max_coarse:
         coarse_list = coarse_list[:_max_coarse]
         logging.warning("MIFIR_MAX_COARSE=%d: processing only the first %d "
                         "coarse groups (debug/benchmark mode).",
                         _max_coarse, len(coarse_list))
-    coarse_exec = None
     coarse_futs = {}
-    if args.fir_coarse_workers and args.fir_coarse_workers > 0 and coarse_list:
-        import multiprocessing as _mp
-        from concurrent.futures import ProcessPoolExecutor
-        n_cw = min(args.fir_coarse_workers, len(coarse_list))
-        logging.info("Generating coarse templates in %d spawned CPU worker(s)",
-                     n_cw)
-        coarse_exec = ProcessPoolExecutor(
-            max_workers=n_cw, mp_context=_mp.get_context('spawn'),
-            initializer=coarse_gen_init,
-            initargs=(args.bank_file, flen, delta_f, 'complex64', flow,
-                      args.order, args.approximant))
-        _coarse_lookahead = 2 * n_cw
-        _coarse_next = 0
+    _coarse_next = 0
+    if coarse_pool is not None and coarse_list:
+        logging.info("Prefetching coarse templates from %d worker(s)",
+                     coarse_pool._processes)
+        _coarse_lookahead = 2 * coarse_pool._processes
 
         def _coarse_submit():
             global _coarse_next
             if _coarse_next < len(coarse_list):
-                coarse_futs[_coarse_next] = coarse_exec.submit(
-                    coarse_gen_one, coarse_list[_coarse_next])
+                coarse_futs[_coarse_next] = coarse_pool.apply_async(
+                    coarse_gen_one, (coarse_list[_coarse_next],))
                 _coarse_next += 1
         for _ in range(min(_coarse_lookahead, len(coarse_list))):
             _coarse_submit()
@@ -786,8 +800,8 @@ with ctx:
     # Loop over coarse references; reconstruct fine-template SNR from each.
     for c_num, coarse_idx in enumerate(coarse_list):
         _t0 = time.time()
-        if coarse_exec is not None:
-            fd, attrs = coarse_futs.pop(c_num).result()
+        if coarse_pool is not None:
+            fd, attrs = coarse_futs.pop(c_num).get()
             _coarse_submit()   # keep the prefetch window full
             ref_template = coarse_reconstruct(
                 fd, attrs, bank.coarse_bank.table[coarse_idx], delta_f)
@@ -920,8 +934,9 @@ with ctx:
                         return ind, snr_full[ind]
                 process_template(global_id, snr_rescale, sig_rescale,
                                   ref_cache, get_series, get_triggers)
-    if coarse_exec is not None:
-        coarse_exec.shutdown(wait=False, cancel_futures=True)
+    if coarse_pool is not None:
+        coarse_pool.terminate()
+        coarse_pool.join()
     logging.info("Filtering completed")
     _tot = sum(_prof.values()) or 1.0
     logging.info("PROFILE wall (s): " + ", ".join(
