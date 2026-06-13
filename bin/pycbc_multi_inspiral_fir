@@ -404,6 +404,13 @@ with ctx:
     # threshold, the coherent stage, and clustering.
     _prof = {'coarse_gen': 0.0, 'ref_setup': 0.0, 'batch_snr': 0.0,
              'threshold': 0.0, 'coherent': 0.0, 'cluster': 0.0}
+    # The batched GPU SNR ops are queued asynchronously, so by default the
+    # batch_snr timer captures only host queue time and the cost of executing
+    # those kernels lands on the next synchronising stage (the per-template
+    # threshold). Set MIFIR_PROFILE_SYNC=1 to device-synchronise after the
+    # batched pre-pass so the profile attributes GPU time correctly (slower; for
+    # profiling only -- leave unset for the throughput run).
+    _profile_sync = bool(int(os.environ.get("MIFIR_PROFILE_SYNC", "0")))
 
     # --- Batch tile sizing (CUDA) -----------------------------------------
     # The GPU path reconstructs the fine-template SNR series for a TILE of K
@@ -801,6 +808,8 @@ with ctx:
                             rescales_dev, out_pool[(s_num, ifo)])
                         for ki in range(k_tile):
                             tile_series[(ki, s_num, ifo)] = rows[ki]
+                if _profile_sync:
+                    scheme.mgr.state.context.synchronize()
                 _prof['batch_snr'] += time.time() - _t0
 
             for ki in range(k_tile):
