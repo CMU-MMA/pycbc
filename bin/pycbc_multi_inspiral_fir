@@ -67,7 +67,7 @@ from pycbc.events import (
     ranking, coherent as coh, threshold_only, EventManagerCoherent
 )
 from pycbc.filter.matched_ratio import RatioMatchedFilterControl
-from pycbc.types import zeros, float32, complex64, angle_as_radians
+from pycbc.types import zeros, float32, complex64, angle_as_radians, Array
 from pycbc.waveform.bank import RatioFilterBank
 from pycbc.tmpltbank.sky_grid import SkyGrid
 
@@ -191,6 +191,17 @@ fir_group.add_argument("--template-normalization-method",
 fir_group.add_argument("--fft-workers", type=int, default=None,
                        help="Number of threads for the CPU (scipy) batched "
                             "FFTs in the FIR engine.")
+fir_group.add_argument("--fir-tile", type=int, default=32,
+                       help="(CUDA only.) Number of fine templates whose SNR "
+                            "time series are reconstructed in one batched GPU "
+                            "pass (one half-spectrum multiply + one batched "
+                            "ifft + one assemble), so the GPU is fed large "
+                            "kernels instead of tens of thousands of tiny ones. "
+                            "Automatically capped to fit GPU memory (one "
+                            "analyze-length complex64 SNR row per (segment, "
+                            "detector) is retained per template). Larger uses "
+                            "more memory; the result is identical. Ignored on "
+                            "CPU. Default: 32.")
 
 strain.insert_strain_option_group_multi_ifo(parser)
 strain.StrainSegments.insert_segment_option_group_multi_ifo(parser)
@@ -387,31 +398,373 @@ with ctx:
     # Debug only (perf/correctness A-B), env-gated: stop after this many coarse
     # groups so a bounded real-data comparison runs in minutes. 0/unset = full.
     _max_coarse = int(os.environ.get("MIFIR_MAX_COARSE", "0"))
+    # Lightweight wall-clock profile of the major stages (one INFO line at the
+    # end): CPU coarse-template generation, per-(segment, detector) reference
+    # SNR setup, the batched fine-template SNR reconstruction, the per-template
+    # threshold, the coherent stage, and clustering.
+    _prof = {'coarse_gen': 0.0, 'ref_setup': 0.0, 'batch_snr': 0.0,
+             'threshold': 0.0, 'coherent': 0.0, 'cluster': 0.0}
+
+    # --- Batch tile sizing (CUDA) -----------------------------------------
+    # The GPU path reconstructs the fine-template SNR series for a TILE of K
+    # templates in one pass (one big half-spectrum multiply + one batched ifft +
+    # one assemble), so the GPU sees a handful of large kernels per coarse group
+    # instead of tens of thousands of tiny, launch-bound ones. K is capped by
+    # GPU memory: per template we retain one analyze-length complex64 SNR row
+    # per (segment, detector) plus a shared per-detector multiply/ifft scratch
+    # (~1.1x analyze length).
+    if on_cuda:
+        import pycuda.driver as _drv
+        L_max = max(seg.analyze.stop - seg.analyze.start
+                    for seg in segments[args.instruments[0]])
+        bytes_per_k = 8 * (n_seg * nifo * L_max + nifo * int(1.1 * L_max))
+        free_b, total_b = _drv.mem_get_info()
+        k_mem = max(1, int(free_b * 0.5) // bytes_per_k)
+        TILE = max(1, min(args.fir_tile, k_mem))
+        if TILE < args.fir_tile:
+            logging.warning("FIR batch tile shrunk %d -> %d to fit GPU memory "
+                            "(free %.1f GB, ~%.2f GB retained per template)",
+                            args.fir_tile, TILE, free_b / 2**30,
+                            bytes_per_k / 2**30)
+        else:
+            logging.info("FIR batch tile K=%d (~%.2f GB batch buffers; free "
+                         "%.1f GB of %.1f GB)", TILE,
+                         TILE * bytes_per_k / 2**30, free_b / 2**30,
+                         total_b / 2**30)
+        # Reusable output pool: one (K x analyze_len) device buffer per
+        # (segment, detector). The assemble kernel writes every sample of every
+        # row, so the pool is fully overwritten each tile -> safely reused
+        # across tiles and coarse groups (no stale samples, no pre-zeroing).
+        out_pool = {(s, ifo): zeros(TILE * (segments[ifo][s].analyze.stop
+                                            - segments[ifo][s].analyze.start),
+                                    dtype=complex64)
+                    for s in range(n_seg) for ifo in args.instruments}
+    else:
+        TILE = 1
+        out_pool = None
+
+    def process_template(global_id, snr_rescale, sig_rescale, ref_cache,
+                         get_series):
+        """Run the (unchanged) coherent statistic for one fine template across
+        all segments. ``get_series(s_num, ifo)`` returns that detector's
+        fine-normalised complex SNR series over the segment's analyze slice (a
+        device Array under CUDA, host numpy on CPU)."""
+        template_params = bank.table[global_id]
+        # Fine-template sigmasq per ifo from the coarse reference sigmasq.
+        # new_template (and the stored per-template sigmasq) uses segment 0,
+        # matching pycbc_multi_inspiral which calls new_template at s_num==0.
+        sigmasq = {ifo: ref_cache[(0, ifo)][2] * sig_rescale ** 2
+                   for ifo in args.instruments}
+        event_mgr.new_template(tmplt=template_params, sigmasq=sigmasq)
+
+        for s_num in range(n_seg):
+            stilde = {ifo: segments[ifo][s_num] for ifo in args.instruments}
+            # Antenna-pattern weights use THIS segment's sensitivity (sigma):
+            # the reference sigmasq is segment-dependent through the PSD, so
+            # sigma must be recomputed per segment (matching the brute search).
+            sigma = {ifo: np.sqrt(ref_cache[(s_num, ifo)][2] * sig_rescale ** 2)
+                     for ifo in args.instruments}
+            analyse_segment = True
+            for ifo in args.instruments:
+                if not inj_filter_rejector[ifo].template_segment_checker(
+                    bank, global_id, stilde[ifo]
+                ):
+                    analyse_segment = False
+            if not analyse_segment:
+                continue
+
+            # Reconstruct per-detector complex SNR(t) for this fine template.
+            # On CUDA the series was reconstructed in the batched pre-pass and is
+            # kept ON THE DEVICE; the threshold runs on-device (sparse triggers
+            # only) and the full series is pulled to the host lazily, once, only
+            # if a coincidence needs it for the coherent combine -- so most
+            # templates never copy the (large) SNR series to the host at all.
+            snr_dict = dict.fromkeys(args.instruments)
+            idx = dict.fromkeys(args.instruments)
+            snr = dict.fromkeys(args.instruments)
+            wraparound_dict = dict.fromkeys(args.instruments)
+            _t0 = time.time()
+            for ifo in args.instruments:
+                snr_full = get_series(s_num, ifo)
+                snr_dict[ifo] = snr_full
+                wraparound_dict[ifo] = len(snr_full)
+                assert wraparound_dict[ifo] > 0, \
+                    f'SNR time series for {ifo} is empty'
+                if on_cuda:
+                    locs, vals = threshold_only(
+                        snr_full, args.sngl_snr_threshold)
+                    idx[ifo] = locs.astype(np.int32)
+                    snr[ifo] = vals
+                else:
+                    ind = np.flatnonzero(
+                        np.abs(snr_full) > args.sngl_snr_threshold
+                    ).astype(np.int32)
+                    idx[ifo] = ind
+                    snr[ifo] = snr_full[ind]
+            _prof['threshold'] += time.time() - _t0
+
+            n_trigs = [len(snr[ifo]) for ifo in args.instruments]
+            if not any(n_trigs):
+                continue
+
+            # Under CUDA, snr_dict still holds on-device arrays. Materialize host
+            # copies lazily (once) the first time a coincidence needs the full
+            # per-detector series; templates with no coincidence never copy.
+            snr_host_ready = not on_cuda
+
+            _t0 = time.time()
+            # ===========================================================
+            # Coherent statistic (unchanged from pycbc_multi_inspiral).
+            # ===========================================================
+            for slide in range(num_slides):
+                for position_index in range(len(sky_positions)):
+                    idx_dict = {
+                        ifo: idx[ifo][
+                            np.logical_and(
+                                idx[ifo]
+                                > time_delay_idx[0][position_index][ifo],
+                                idx[ifo]
+                                < time_delay_idx[0][position_index][ifo]
+                                + wraparound_dict[ifo],
+                            )
+                        ]
+                        for ifo in args.instruments
+                    }
+                    coinc_idx = coh.get_coinc_indexes(
+                        idx_dict, time_delay_idx[slide][position_index],
+                        args.nifo_sngl_snr_threshold, wraparound_dict
+                    )
+                    coinc_idx_det_frame = {
+                        ifo: (coinc_idx
+                              + time_delay_idx[slide][position_index][ifo])
+                        % wraparound_dict[ifo]
+                        for ifo in args.instruments
+                    }
+                    if len(coinc_idx) != 0:
+                        if not snr_host_ready:
+                            # First coincidence for this (fine template,
+                            # segment): pull every detector's full SNR
+                            # series to the host once. The coherent combine
+                            # then runs on host arrays exactly as on CPU
+                            # (bit-identical), with no further device->host
+                            # copies; sub-threshold detectors are still
+                            # rescued because the full series is present.
+                            for _ifo in args.instruments:
+                                snr_dict[_ifo] = snr_dict[_ifo].numpy()
+                            snr_host_ready = True
+                        (rho_coinc, coinc_idx,
+                         coinc_triggers) = coh.coincident_snr(
+                            snr_dict, coinc_idx, args.coinc_threshold,
+                            time_delay_idx[slide][position_index],
+                        )
+                    else:
+                        coinc_triggers = {}
+                    if len(coinc_idx) != 0 and nifo > 1:
+                        fp = {
+                            ifo: antenna_pattern[ifo][position_index][0]
+                            for ifo in args.instruments
+                        }
+                        fc = {
+                            ifo: antenna_pattern[ifo][position_index][1]
+                            for ifo in args.instruments
+                        }
+                        if args.projection == 'left+right':
+                            project_l = coh.get_projection_matrix(
+                                fp, fc, sigma, projection='left')
+                            (rho_coh_l, coinc_idx_l, coinc_triggers_l,
+                             rho_coinc_l) = coh.coherent_snr(
+                                coinc_triggers, coinc_idx, 0.0,
+                                project_l, rho_coinc)
+                            project_r = coh.get_projection_matrix(
+                                fp, fc, sigma, projection='right')
+                            (rho_coh_r, coinc_idx_r, coinc_triggers_r,
+                             rho_coinc_r) = coh.coherent_snr(
+                                coinc_triggers, coinc_idx, 0.0,
+                                project_r, rho_coinc)
+                            l_above = rho_coh_l > args.coinc_threshold
+                            r_above = rho_coh_r > args.coinc_threshold
+                            lr_above = l_above & r_above
+                            rho_coh_l = rho_coh_l[lr_above]
+                            rho_coh_r = rho_coh_r[lr_above]
+                            coinc_idx_l = coinc_idx_l[lr_above]
+                            coinc_idx_r = coinc_idx_r[lr_above]
+                            for ifo in coinc_triggers_l.keys():
+                                coinc_triggers_l[ifo] = \
+                                    coinc_triggers_l[ifo][lr_above]
+                            for ifo in coinc_triggers_r.keys():
+                                coinc_triggers_r[ifo] = \
+                                    coinc_triggers_r[ifo][lr_above]
+                            rho_coinc_l = rho_coinc_l[lr_above]
+                            rho_coinc_r = rho_coinc_r[lr_above]
+                            max_idx = np.argmax(
+                                [rho_coh_l, rho_coh_r], axis=0)
+                            rho_coh = np.where(
+                                max_idx == 0, rho_coh_l, rho_coh_r)
+                            coinc_idx = np.where(
+                                max_idx == 0, coinc_idx_l, coinc_idx_r)
+                            coinc_triggers = {
+                                ifo: np.where(
+                                    max_idx == 0,
+                                    coinc_triggers_l[ifo],
+                                    coinc_triggers_r[ifo])
+                                for ifo in coinc_triggers_l
+                            }
+                            rho_coinc = np.where(
+                                max_idx == 0, rho_coinc_l, rho_coinc_r)
+                        else:
+                            project = coh.get_projection_matrix(
+                                fp, fc, sigma, projection=args.projection)
+                            (rho_coh, coinc_idx, coinc_triggers,
+                             rho_coinc) = coh.coherent_snr(
+                                coinc_triggers, coinc_idx,
+                                args.coinc_threshold, project, rho_coinc)
+                        if len(coinc_idx) != 0:
+                            (null, rho_coh, rho_coinc, coinc_idx,
+                             coinc_triggers) = coh.null_snr(
+                                rho_coh, rho_coinc,
+                                apply_cut=args.do_null_cut,
+                                null_min=args.null_min,
+                                null_grad=args.null_grad,
+                                null_step=args.null_step,
+                                snrv=coinc_triggers, index=coinc_idx)
+                    if len(coinc_idx) != 0:
+                        coinc_idx_det_frame = {
+                            ifo: (coinc_idx
+                                  + time_delay_idx[slide][position_index][ifo])
+                            % wraparound_dict[ifo]
+                            for ifo in args.instruments
+                        }
+                        coherent_ifo_trigs = {
+                            ifo: snr_dict[ifo][coinc_idx_det_frame[ifo]]
+                            for ifo in args.instruments
+                        }
+                        num_events = (
+                            len(coinc_idx) if nifo == 1 else len(rho_coh)
+                        )
+                        # Phase 1: chi-square vetoes stubbed to zero.
+                        chisq = {
+                            ifo: np.zeros(num_events, dtype=np.float32)
+                            for ifo in args.instruments
+                        }
+                        chisq_dof = {
+                            ifo: np.ones(num_events, dtype=np.int32)
+                            for ifo in args.instruments
+                        }
+                        network_chisq_dict = coh.network_chisq(
+                            chisq, chisq_dof, coherent_ifo_trigs)
+                        if nifo > 1:
+                            reweighted_snr = ranking.newsnr(
+                                rho_coh, network_chisq_dict,
+                                q=args.chisq_index, n=args.chisq_nhigh)
+                            reweighted_snr = coh.reweight_snr_by_null(
+                                reweighted_snr, null, rho_coh,
+                                null_min=args.null_min,
+                                null_grad=args.null_grad,
+                                null_step=args.null_step)
+                        else:
+                            rho_sngl = abs(
+                                snr_dict[args.instruments[0]][
+                                    coinc_idx_det_frame[args.instruments[0]]
+                                ])
+                            reweighted_snr = ranking.newsnr(
+                                rho_sngl, network_chisq_dict,
+                                q=args.chisq_index, n=args.chisq_nhigh)
+                        for ifo in args.instruments:
+                            ifo_out_vals['bank_chisq'] = np.zeros(
+                                num_events, dtype=np.float32)
+                            ifo_out_vals['bank_chisq_dof'] = np.ones(
+                                num_events, dtype=np.int32)
+                            ifo_out_vals['auto_chisq'] = np.zeros(
+                                num_events, dtype=np.float32)
+                            ifo_out_vals['auto_chisq_dof'] = np.ones(
+                                num_events, dtype=np.int32)
+                            ifo_out_vals['chisq'] = chisq[ifo]
+                            ifo_out_vals['chisq_dof'] = chisq_dof[ifo]
+                            ifo_out_vals['time_index'] = (
+                                coinc_idx_det_frame[ifo]
+                                + stilde[ifo].cumulative_index)
+                            ifo_out_vals['snr'] = coherent_ifo_trigs[ifo]
+                            ifo_out_vals['ifo'] = [
+                                event_mgr.ifo_dict[ifo]] * num_events
+                            ifo_out_vals['slide_id'] = [slide] * num_events
+                            event_mgr.add_template_events_to_ifo(
+                                ifo, ifo_names,
+                                [ifo_out_vals[n] for n in ifo_names])
+                        if nifo > 1:
+                            network_out_vals['coherent_snr'] = rho_coh
+                            network_out_vals['null_snr'] = null
+                        else:
+                            network_out_vals['coherent_snr'] = abs(
+                                snr_dict[args.instruments[0]][
+                                    coinc_idx_det_frame[args.instruments[0]]
+                                ])
+                        network_out_vals['reweighted_snr'] = reweighted_snr
+                        network_out_vals['my_network_chisq'] = np.real(
+                            network_chisq_dict)
+                        network_out_vals['time_index'] = (
+                            coinc_idx
+                            + stilde[args.instruments[0]].cumulative_index)
+                        network_out_vals['nifo'] = [nifo] * num_events
+                        network_out_vals['dec'] = [
+                            sky_positions.decs[position_index]
+                        ] * num_events
+                        network_out_vals['ra'] = [
+                            sky_positions.ras[position_index]
+                        ] * num_events
+                        network_out_vals['slide_id'] = [slide] * num_events
+                        event_mgr.add_template_events_to_network(
+                            network_names,
+                            [network_out_vals[n] for n in network_names])
+            _prof['coherent'] += time.time() - _t0
+
+            # Cluster this fine template's events (per slide).
+            _t0 = time.time()
+            if args.cluster_method == "window":
+                cluster_window = int(args.cluster_window * sample_rate)
+            elif args.cluster_method == "template":
+                cluster_window = int(
+                    template_params.chirp_length * sample_rate)
+            for slide in range(num_slides):
+                event_mgr.cluster_template_network_events(
+                    'time_index', 'reweighted_snr', cluster_window,
+                    slide=slide)
+            _prof['cluster'] += time.time() - _t0
+        event_mgr.finalize_template_events()
+
     # Loop over coarse references; reconstruct fine-template SNR from each.
     for c_num, coarse_idx in enumerate(bank.coarse_indices):
         if _max_coarse and c_num >= _max_coarse:
             logging.warning("MIFIR_MAX_COARSE=%d reached: stopping early "
                             "(debug/benchmark mode).", _max_coarse)
             break
+        _t0 = time.time()
         ref_template = bank.get_coarse_template(coarse_idx)
+        _prof['coarse_gen'] += time.time() - _t0
         taps, counts, fine_indices = bank.get_firs(coarse_idx)
-        # FIR taps are detector-independent -> prepare the frequency-domain
-        # filters once for the whole coarse group.
+        # FIR taps are detector-independent -> prepare the FD filters once for
+        # the whole coarse group.
         filters_f, _ = engines[args.instruments[0]].prepare_filters(taps, counts)
         n_fine = len(fine_indices)
-        # Use one overlap-save tap count for the whole coarse group (the group
-        # max). This is a valid (filter support fits) and result-invariant
-        # choice, and it lets every fine template in the group share the same
+        # One overlap-save tap count for the whole coarse group (the group max):
+        # valid, result-invariant, and lets every fine template share the same
         # block-FFT grid -> the (fine-template-independent) reference block FFTs
         # are computed once per (segment, detector) and reused (essential for
         # the batched GPU path; also speeds the CPU block-FFT cache).
         n_taps_group = int(counts.max())
+        # Per-template fine-normalisation factors, vectorised over the group.
+        snr_rescales = np.asarray(bank.snr_rescale(
+            fine_indices, method=args.template_normalization_method),
+            dtype=np.float64)
+        sig_rescales = np.asarray(bank.sigma_rescale(
+            fine_indices, method=args.template_normalization_method),
+            dtype=np.float64)
         logging.info("Coarse %d/%d (idx %d): %d fine templates",
                      c_num + 1, n_coarse, coarse_idx, n_fine)
 
-        # Compute the reference SNR once per (segment, detector) and cache it
-        # (plus a per-(segment, detector) block-FFT cache reused across all
-        # fine templates in this coarse group, and the reference sigmasq).
+        # Reference SNR once per (segment, detector) (kept on the device under
+        # CUDA), plus a per-(segment, detector) block-FFT cache reused across all
+        # fine templates in this coarse group, and the reference sigmasq.
+        _t0 = time.time()
         ref_cache = {}
         for s_num in range(n_seg):
             for ifo in args.instruments:
@@ -420,321 +773,60 @@ with ctx:
                     stilde_seg, stilde_seg.psd, ref_template
                 )
                 ref_cache[(s_num, ifo)] = (engines[ifo].ref_snr, {}, h_norm)
+        _prof['ref_setup'] += time.time() - _t0
 
-        # Loop over fine templates (the EventManager "template" unit).
-        for j in range(n_fine):
-            global_id = int(fine_indices[j])
-            n_taps_j = int(counts[j])
-            filt = filters_f[j]
-            snr_rescale = float(
-                bank.snr_rescale(global_id,
-                                 method=args.template_normalization_method)
-            )
-            sig_rescale = float(
-                bank.sigma_rescale(global_id,
-                                   method=args.template_normalization_method)
-            )
-            template_params = bank.table[global_id]
+        # Upload this coarse group's FD filters to the device once (CUDA).
+        if on_cuda:
+            filters_dev = Array(np.ascontiguousarray(
+                filters_f.reshape(-1), dtype=np.complex64))
+            N_FFT = engines[args.instruments[0]].fir_fft_len
 
-            # Fine-template sigmasq per ifo from the coarse reference sigmasq.
-            # new_template (and the stored per-template sigmasq) uses segment 0,
-            # matching pycbc_multi_inspiral which calls new_template at s_num==0.
-            sigmasq = {
-                ifo: ref_cache[(0, ifo)][2] * sig_rescale ** 2
-                for ifo in args.instruments
-            }
-            event_mgr.new_template(tmplt=template_params, sigmasq=sigmasq)
+        # Tile over fine templates: batched SNR pre-pass (CUDA), then the
+        # per-template coherent processing (identical semantics either path).
+        for a in range(0, n_fine, TILE):
+            b = min(a + TILE, n_fine)
+            k_tile = b - a
 
-            for s_num in range(n_seg):
-                stilde = {ifo: segments[ifo][s_num] for ifo in args.instruments}
-                # The antenna-pattern weights in the coherent projection use the
-                # sensitivity (sigma) of THIS segment -- the reference sigmasq is
-                # segment-dependent through the PSD, so sigma must be recomputed
-                # per segment (matching pycbc_multi_inspiral). Using a single
-                # per-template sigma would give the wrong projection/coherent SNR
-                # on real data with time-varying PSDs.
-                sigma = {
-                    ifo: np.sqrt(ref_cache[(s_num, ifo)][2] * sig_rescale ** 2)
-                    for ifo in args.instruments
-                }
-                analyse_segment = True
-                for ifo in args.instruments:
-                    if not inj_filter_rejector[ifo].template_segment_checker(
-                        bank, global_id, stilde[ifo]
-                    ):
-                        analyse_segment = False
-                if not analyse_segment:
-                    continue
+            tile_series = {}
+            if on_cuda:
+                _t0 = time.time()
+                filt_slice = filters_dev[a * N_FFT:b * N_FFT]
+                rescales_dev = Array(snr_rescales[a:b].astype(np.float32))
+                for s_num in range(n_seg):
+                    for ifo in args.instruments:
+                        ref_arr, bcache, _ = ref_cache[(s_num, ifo)]
+                        rows = engines[ifo].fine_snr_timeseries_batch(
+                            filt_slice, k_tile, n_taps_group,
+                            segments[ifo][s_num].analyze, ref_arr, bcache,
+                            rescales_dev, out_pool[(s_num, ifo)])
+                        for ki in range(k_tile):
+                            tile_series[(ki, s_num, ifo)] = rows[ki]
+                _prof['batch_snr'] += time.time() - _t0
 
-                # Reconstruct per-detector complex SNR(t) for this fine template.
-                # On CUDA the SNR series is kept ON THE DEVICE and thresholded
-                # on-device (events.threshold_only), so only the sparse triggers
-                # cross to the host -- the whole array no longer makes a
-                # device->host round trip per fine template. The full per-IFO
-                # series is retained (on device) so the coherent stage can
-                # rescue sub-threshold detectors at network candidate indices,
-                # matching brute pycbc_multi_inspiral; it is pulled to the host
-                # lazily, once, only if a coincidence actually needs it.
-                snr_dict = dict.fromkeys(args.instruments)
-                idx = dict.fromkeys(args.instruments)
-                snr = dict.fromkeys(args.instruments)
-                wraparound_dict = dict.fromkeys(args.instruments)
-                for ifo in args.instruments:
-                    ref_arr, bcache, _ = ref_cache[(s_num, ifo)]
-                    series = engines[ifo].fine_snr_timeseries(
-                        filt, n_taps_group, stilde[ifo].analyze,
-                        ref_snr=ref_arr, block_cache=bcache,
-                        return_device=on_cuda
-                    )
-                    # Fine-template normalized complex SNR over the analyze slice
-                    # (a device Array under CUDA, host numpy on CPU).
-                    snr_full = series[stilde[ifo].analyze] / snr_rescale
-                    snr_dict[ifo] = snr_full
-                    wraparound_dict[ifo] = len(snr_full)
-                    assert wraparound_dict[ifo] > 0, \
-                        f'SNR time series for {ifo} is empty'
-                    if on_cuda:
-                        # On-device threshold: returns only the sparse
-                        # (locations, values) above threshold. snr_full already
-                        # carries the fine-template normalization, so the
-                        # returned values need no further rescaling -- matching
-                        # the host branch's snr_full[ind].
-                        locs, vals = threshold_only(
-                            snr_full, args.sngl_snr_threshold)
-                        idx[ifo] = locs.astype(np.int32)
-                        snr[ifo] = vals
-                    else:
-                        ind = np.flatnonzero(
-                            np.abs(snr_full) > args.sngl_snr_threshold
-                        ).astype(np.int32)
-                        idx[ifo] = ind
-                        snr[ifo] = snr_full[ind]
-
-                n_trigs = [len(snr[ifo]) for ifo in args.instruments]
-                if not any(n_trigs):
-                    continue
-
-                # Under CUDA, snr_dict still holds on-device arrays. Materialize
-                # host copies lazily (once) the first time a coincidence needs
-                # the full per-detector series; templates with no coincidence
-                # never copy the (large) SNR series to the host at all.
-                snr_host_ready = not on_cuda
-
-                # ===========================================================
-                # Coherent statistic (unchanged from pycbc_multi_inspiral).
-                # ===========================================================
-                for slide in range(num_slides):
-                    for position_index in range(len(sky_positions)):
-                        idx_dict = {
-                            ifo: idx[ifo][
-                                np.logical_and(
-                                    idx[ifo]
-                                    > time_delay_idx[0][position_index][ifo],
-                                    idx[ifo]
-                                    < time_delay_idx[0][position_index][ifo]
-                                    + wraparound_dict[ifo],
-                                )
-                            ]
-                            for ifo in args.instruments
-                        }
-                        coinc_idx = coh.get_coinc_indexes(
-                            idx_dict, time_delay_idx[slide][position_index],
-                            args.nifo_sngl_snr_threshold, wraparound_dict
-                        )
-                        coinc_idx_det_frame = {
-                            ifo: (coinc_idx
-                                  + time_delay_idx[slide][position_index][ifo])
-                            % wraparound_dict[ifo]
-                            for ifo in args.instruments
-                        }
-                        if len(coinc_idx) != 0:
-                            if not snr_host_ready:
-                                # First coincidence for this (fine template,
-                                # segment): pull every detector's full SNR
-                                # series to the host once. The coherent combine
-                                # then runs on host arrays exactly as on CPU
-                                # (bit-identical), with no further device->host
-                                # copies; sub-threshold detectors are still
-                                # rescued because the full series is present.
-                                for _ifo in args.instruments:
-                                    snr_dict[_ifo] = snr_dict[_ifo].numpy()
-                                snr_host_ready = True
-                            (rho_coinc, coinc_idx,
-                             coinc_triggers) = coh.coincident_snr(
-                                snr_dict, coinc_idx, args.coinc_threshold,
-                                time_delay_idx[slide][position_index],
-                            )
-                        else:
-                            coinc_triggers = {}
-                        if len(coinc_idx) != 0 and nifo > 1:
-                            fp = {
-                                ifo: antenna_pattern[ifo][position_index][0]
-                                for ifo in args.instruments
-                            }
-                            fc = {
-                                ifo: antenna_pattern[ifo][position_index][1]
-                                for ifo in args.instruments
-                            }
-                            if args.projection == 'left+right':
-                                project_l = coh.get_projection_matrix(
-                                    fp, fc, sigma, projection='left')
-                                (rho_coh_l, coinc_idx_l, coinc_triggers_l,
-                                 rho_coinc_l) = coh.coherent_snr(
-                                    coinc_triggers, coinc_idx, 0.0,
-                                    project_l, rho_coinc)
-                                project_r = coh.get_projection_matrix(
-                                    fp, fc, sigma, projection='right')
-                                (rho_coh_r, coinc_idx_r, coinc_triggers_r,
-                                 rho_coinc_r) = coh.coherent_snr(
-                                    coinc_triggers, coinc_idx, 0.0,
-                                    project_r, rho_coinc)
-                                l_above = rho_coh_l > args.coinc_threshold
-                                r_above = rho_coh_r > args.coinc_threshold
-                                lr_above = l_above & r_above
-                                rho_coh_l = rho_coh_l[lr_above]
-                                rho_coh_r = rho_coh_r[lr_above]
-                                coinc_idx_l = coinc_idx_l[lr_above]
-                                coinc_idx_r = coinc_idx_r[lr_above]
-                                for ifo in coinc_triggers_l.keys():
-                                    coinc_triggers_l[ifo] = \
-                                        coinc_triggers_l[ifo][lr_above]
-                                for ifo in coinc_triggers_r.keys():
-                                    coinc_triggers_r[ifo] = \
-                                        coinc_triggers_r[ifo][lr_above]
-                                rho_coinc_l = rho_coinc_l[lr_above]
-                                rho_coinc_r = rho_coinc_r[lr_above]
-                                max_idx = np.argmax(
-                                    [rho_coh_l, rho_coh_r], axis=0)
-                                rho_coh = np.where(
-                                    max_idx == 0, rho_coh_l, rho_coh_r)
-                                coinc_idx = np.where(
-                                    max_idx == 0, coinc_idx_l, coinc_idx_r)
-                                coinc_triggers = {
-                                    ifo: np.where(
-                                        max_idx == 0,
-                                        coinc_triggers_l[ifo],
-                                        coinc_triggers_r[ifo])
-                                    for ifo in coinc_triggers_l
-                                }
-                                rho_coinc = np.where(
-                                    max_idx == 0, rho_coinc_l, rho_coinc_r)
-                            else:
-                                project = coh.get_projection_matrix(
-                                    fp, fc, sigma, projection=args.projection)
-                                (rho_coh, coinc_idx, coinc_triggers,
-                                 rho_coinc) = coh.coherent_snr(
-                                    coinc_triggers, coinc_idx,
-                                    args.coinc_threshold, project, rho_coinc)
-                            if len(coinc_idx) != 0:
-                                (null, rho_coh, rho_coinc, coinc_idx,
-                                 coinc_triggers) = coh.null_snr(
-                                    rho_coh, rho_coinc,
-                                    apply_cut=args.do_null_cut,
-                                    null_min=args.null_min,
-                                    null_grad=args.null_grad,
-                                    null_step=args.null_step,
-                                    snrv=coinc_triggers, index=coinc_idx)
-                        if len(coinc_idx) != 0:
-                            coinc_idx_det_frame = {
-                                ifo: (coinc_idx
-                                      + time_delay_idx[slide][position_index][ifo])
-                                % wraparound_dict[ifo]
-                                for ifo in args.instruments
-                            }
-                            coherent_ifo_trigs = {
-                                ifo: snr_dict[ifo][coinc_idx_det_frame[ifo]]
-                                for ifo in args.instruments
-                            }
-                            num_events = (
-                                len(coinc_idx) if nifo == 1 else len(rho_coh)
-                            )
-                            # Phase 1: chi-square vetoes stubbed to zero.
-                            chisq = {
-                                ifo: np.zeros(num_events, dtype=np.float32)
-                                for ifo in args.instruments
-                            }
-                            chisq_dof = {
-                                ifo: np.ones(num_events, dtype=np.int32)
-                                for ifo in args.instruments
-                            }
-                            network_chisq_dict = coh.network_chisq(
-                                chisq, chisq_dof, coherent_ifo_trigs)
-                            if nifo > 1:
-                                reweighted_snr = ranking.newsnr(
-                                    rho_coh, network_chisq_dict,
-                                    q=args.chisq_index, n=args.chisq_nhigh)
-                                reweighted_snr = coh.reweight_snr_by_null(
-                                    reweighted_snr, null, rho_coh,
-                                    null_min=args.null_min,
-                                    null_grad=args.null_grad,
-                                    null_step=args.null_step)
-                            else:
-                                rho_sngl = abs(
-                                    snr_dict[args.instruments[0]][
-                                        coinc_idx_det_frame[args.instruments[0]]
-                                    ])
-                                reweighted_snr = ranking.newsnr(
-                                    rho_sngl, network_chisq_dict,
-                                    q=args.chisq_index, n=args.chisq_nhigh)
-                            for ifo in args.instruments:
-                                ifo_out_vals['bank_chisq'] = np.zeros(
-                                    num_events, dtype=np.float32)
-                                ifo_out_vals['bank_chisq_dof'] = np.ones(
-                                    num_events, dtype=np.int32)
-                                ifo_out_vals['auto_chisq'] = np.zeros(
-                                    num_events, dtype=np.float32)
-                                ifo_out_vals['auto_chisq_dof'] = np.ones(
-                                    num_events, dtype=np.int32)
-                                ifo_out_vals['chisq'] = chisq[ifo]
-                                ifo_out_vals['chisq_dof'] = chisq_dof[ifo]
-                                ifo_out_vals['time_index'] = (
-                                    coinc_idx_det_frame[ifo]
-                                    + stilde[ifo].cumulative_index)
-                                ifo_out_vals['snr'] = coherent_ifo_trigs[ifo]
-                                ifo_out_vals['ifo'] = [
-                                    event_mgr.ifo_dict[ifo]] * num_events
-                                ifo_out_vals['slide_id'] = [slide] * num_events
-                                event_mgr.add_template_events_to_ifo(
-                                    ifo, ifo_names,
-                                    [ifo_out_vals[n] for n in ifo_names])
-                            if nifo > 1:
-                                network_out_vals['coherent_snr'] = rho_coh
-                                network_out_vals['null_snr'] = null
-                            else:
-                                network_out_vals['coherent_snr'] = abs(
-                                    snr_dict[args.instruments[0]][
-                                        coinc_idx_det_frame[args.instruments[0]]
-                                    ])
-                            network_out_vals['reweighted_snr'] = reweighted_snr
-                            network_out_vals['my_network_chisq'] = np.real(
-                                network_chisq_dict)
-                            network_out_vals['time_index'] = (
-                                coinc_idx
-                                + stilde[args.instruments[0]].cumulative_index)
-                            network_out_vals['nifo'] = [nifo] * num_events
-                            network_out_vals['dec'] = [
-                                sky_positions.decs[position_index]
-                            ] * num_events
-                            network_out_vals['ra'] = [
-                                sky_positions.ras[position_index]
-                            ] * num_events
-                            network_out_vals['slide_id'] = [slide] * num_events
-                            event_mgr.add_template_events_to_network(
-                                network_names,
-                                [network_out_vals[n] for n in network_names])
-
-                # Cluster this fine template's events (per slide).
-                if args.cluster_method == "window":
-                    cluster_window = int(args.cluster_window * sample_rate)
-                elif args.cluster_method == "template":
-                    cluster_window = int(
-                        template_params.chirp_length * sample_rate)
-                for slide in range(num_slides):
-                    event_mgr.cluster_template_network_events(
-                        'time_index', 'reweighted_snr', cluster_window,
-                        slide=slide)
-            event_mgr.finalize_template_events()
+            for ki in range(k_tile):
+                j = a + ki
+                global_id = int(fine_indices[j])
+                snr_rescale = float(snr_rescales[j])
+                sig_rescale = float(sig_rescales[j])
+                if on_cuda:
+                    def get_series(s_num, ifo, _ki=ki):
+                        return tile_series[(_ki, s_num, ifo)]
+                else:
+                    def get_series(s_num, ifo, _j=j, _rescale=snr_rescale):
+                        ref_arr, bcache, _ = ref_cache[(s_num, ifo)]
+                        series = engines[ifo].fine_snr_timeseries(
+                            filters_f[_j], n_taps_group,
+                            segments[ifo][s_num].analyze,
+                            ref_snr=ref_arr, block_cache=bcache,
+                            return_device=False)
+                        return (series[segments[ifo][s_num].analyze]
+                                / _rescale)
+                process_template(global_id, snr_rescale, sig_rescale,
+                                  ref_cache, get_series)
     logging.info("Filtering completed")
+    _tot = sum(_prof.values()) or 1.0
+    logging.info("PROFILE wall (s): " + ", ".join(
+        "%s=%.1f(%.0f%%)" % (k, v, 100 * v / _tot) for k, v in _prof.items()))
 
 time_stop = time.time()
 run_time = time_stop - time_init

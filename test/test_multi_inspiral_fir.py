@@ -144,6 +144,60 @@ class TestRatioEngineSNRSeries(unittest.TestCase):
         self.assertTrue(np.array_equal(a, a2),
                         "block-FFT cache reuse changed the result")
 
+    def test_batched_matches_single(self):
+        """Suite A (Phase 3): the tiled GPU path (fine_snr_timeseries_batch)
+        reproduces the validated single-template GPU path to single precision.
+
+        This is the guard that batching K fine templates into one
+        multiply+ifft+assemble did not change the per-template math: the only
+        differences from the single-filter kernels are the batch dimension (a
+        larger cufft batch -> single-precision round-off) and the fine-rescale
+        division folded into the assemble. CUDA-only (the batched method is the
+        GPU throughput core; on CPU the driver uses the per-template path)."""
+        if self.scheme != 'cuda':
+            self.skipTest("fine_snr_timeseries_batch is the CUDA throughput "
+                          "path; nothing to compare on CPU.")
+        from pycbc.types import zeros, complex64, Array
+        eng = self.eng
+        K = 3
+        n_taps = int(self.counts.max())
+        valid = self.valid
+        L = valid.stop - valid.start
+        # Non-trivial per-template rescales: batched divides them out, so we
+        # multiply them back before comparing to the (un-rescaled) single path.
+        rescales = np.array([1.0, 1.7, 0.6], dtype=np.float32)
+        with self.context:
+            singles = [
+                eng.fine_snr_timeseries(self.filters_f[j], n_taps, valid,
+                                        ref_snr=self.ref, block_cache={},
+                                        return_device=False)
+                for j in range(K)]
+            filt_dev = Array(np.ascontiguousarray(
+                self.filters_f[:K].reshape(-1), dtype=np.complex64))
+            ref_dev = Array(np.ascontiguousarray(self.ref, dtype=np.complex64))
+            rescales_dev = Array(rescales)
+            out_buf = zeros(K * L, dtype=complex64)
+            rows = eng.fine_snr_timeseries_batch(
+                filt_dev, K, n_taps, valid, ref_dev, {}, rescales_dev, out_buf)
+            rows_host = [r.numpy() for r in rows]
+        for j in range(K):
+            got = rows_host[j] * rescales[j]          # undo folded /rescale
+            want = singles[j][valid]
+            denom = np.abs(want).max()
+            # The batched path must actually produce the (non-trivial) series,
+            # not zeros -- ``want`` has clear SNR peaks from the seeded spikes.
+            self.assertGreater(np.abs(got).max(), 0.0,
+                               f"filter {j}: batched output is all zeros")
+            relerr = np.abs(got - want).max() / denom
+            print(f"  batched filter {j}: vs single-template rel err "
+                  f"= {relerr:.3e}")
+            # Bit-identical (relerr == 0) is acceptable here: both run on the
+            # GPU, so unlike the CPU/CUDA parity test there is no silent-fallback
+            # to catch -- the only guard is that batching did not change the math.
+            self.assertLess(
+                relerr, 1e-4, f"filter {j}: batched-vs-single rel err "
+                f"{relerr:.2e} (batching changed the per-template math)")
+
 
 class TestEvenTapCentering(unittest.TestCase):
     """Suite F: even tap counts must use the pycbc_fir_bank centering.

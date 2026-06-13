@@ -90,6 +90,130 @@ def _get_assemble_kernel():
     return krnl
 
 
+_block_gather_kernel_cache = {}
+
+
+def _get_block_gather_kernel():
+    """Return (memoised, per-context) a PyCUDA ElementwiseKernel that builds the
+    overlap-save block-input buffer of the reference SNR ON THE DEVICE.
+
+    Replaces the host-side Python loop + device upload that the original GPU
+    path used to assemble ``block_in`` from a *host* ``ref_snr``. The reference
+    SNR now lives on the device (see :meth:`compute_reference_snr`), so the
+    ``n_blocks`` length-``nfft`` blocks (stride ``nvalid`` in time, starting at
+    sample ``block0``) are gathered directly device->device:
+
+        b = i / nfft;  col = i % nfft;  g = block0 + b*nvalid + col
+        out[i] = (g < n_samples) ? ref[g] : 0
+
+    which is exactly ``ref_snr[t_starts[b] : t_starts[b]+nfft]`` zero-padded at
+    the tail, with ``t_starts[b] = block0 + b*nvalid``.
+    """
+    from pycuda.elementwise import ElementwiseKernel
+    key = id(pycbc.scheme.mgr.state)
+    krnl = _block_gather_kernel_cache.get(key)
+    if krnl is None:
+        krnl = ElementwiseKernel(
+            "pycuda::complex<float> *ref, pycuda::complex<float> *out, "
+            "int nfft, int nvalid, int block0, int n_samples",
+            "int b = i / nfft; int col = i - b * nfft; "
+            "int g = block0 + b * nvalid + col; "
+            "out[i] = (g < n_samples) ? ref[g] "
+            ": pycuda::complex<float>(0.0f, 0.0f)",
+            "fir_block_gather")
+        _block_gather_kernel_cache[key] = krnl
+    return krnl
+
+
+_batched_mult_kernel_cache = {}
+
+
+def _get_batched_mult_kernel():
+    """Return (memoised, per-context) the *tiled* analytic-multiply kernel: the
+    K-filter generalisation of :func:`_get_analytic_mult_kernel`.
+
+    Given ``bf`` (one shared set of ``n_blocks`` length-``nfft`` block spectra,
+    size ``bspan = n_blocks*nfft``) and ``filt`` (a tile of ``K`` length-``nfft``
+    conjugated filters, size ``K*nfft``), it writes the half-spectrum product for
+    every (filter, block) pair into ``out`` (size ``K*bspan``):
+
+        k = i / bspan;  m = i % bspan;  j = m % nfft
+        out[i] = (j < nhalf) ? bf[m] * filt[k*nfft + j] * inv_n : 0
+
+    ``bf`` is read modulo ``bspan`` so the SINGLE cached forward FFT of the
+    reference SNR is broadcast across all ``K`` filters -- no per-filter copy.
+    ``inv_n = 1/nfft`` folds the (unnormalised cufft) inverse-FFT normalisation,
+    identical to the single-filter kernel, so the batched result is bit-for-bit
+    the per-filter result.
+    """
+    from pycuda.elementwise import ElementwiseKernel
+    key = id(pycbc.scheme.mgr.state)
+    krnl = _batched_mult_kernel_cache.get(key)
+    if krnl is None:
+        krnl = ElementwiseKernel(
+            "pycuda::complex<float> *bf, pycuda::complex<float> *filt, "
+            "pycuda::complex<float> *out, int nfft, int nhalf, float inv_n, "
+            "int bspan",
+            "int k = i / bspan; int m = i - k * bspan; int j = m % nfft; "
+            "out[i] = (j < nhalf) ? bf[m] * filt[k * nfft + j] * inv_n "
+            ": pycuda::complex<float>(0.0f, 0.0f)",
+            "fir_analytic_mult_tiled")
+        _batched_mult_kernel_cache[key] = krnl
+    return krnl
+
+
+_batched_assemble_kernel_cache = {}
+
+
+def _get_batched_assemble_kernel():
+    """Return (memoised, per-context) the *tiled* overlap-save assemble+rescale
+    kernel: the K-filter generalisation of :func:`_get_assemble_kernel`, with the
+    per-template fine-normalisation (``snr_rescale``) division folded in.
+
+    For each of ``K`` filters it writes the FULL length-``L`` output row inside
+    ``out`` (size ``K*L``): gathering the overlap-save valid samples inside the
+    valid region ``[lo, hi)`` and writing zero outside it. ``corr`` is the
+    batched inverse-FFT output (size ``K*bspan``); launched over ``K*L``:
+
+        k = i / L;  local = i % L;  p = v_start + local
+        if lo <= p < hi:
+            j = p - assemble_start;  b = j / nvalid;  r = j % nvalid
+            out[k*L + local] = corr[k*bspan + b*nfft + bad_start + r] / rescale[k]
+        else:
+            out[k*L + local] = 0
+
+    Writing the whole row (rather than only ``[lo, hi)``) means ``out`` is fully
+    overwritten every tile, so the caller can REUSE one output buffer across
+    tiles and coarse groups even though the valid region ``[lo, hi)`` shifts
+    when the group's overlap-save tap count changes -- no stale samples, no
+    per-tile pre-zeroing.
+
+    Folding ``/ rescale[k]`` here removes the per-template device divide (and its
+    allocation) the driver used to do (``series[analyze] / snr_rescale``); the
+    float32 division is the same operation the CPU parity path applies on the
+    host (difference is single-precision round-off, ~1e-7, far below the trigger
+    gates).
+    """
+    from pycuda.elementwise import ElementwiseKernel
+    key = id(pycbc.scheme.mgr.state)
+    krnl = _batched_assemble_kernel_cache.get(key)
+    if krnl is None:
+        krnl = ElementwiseKernel(
+            "pycuda::complex<float> *corr, pycuda::complex<float> *out, "
+            "float *rescale, int nfft, int nvalid, int bad_start, "
+            "int assemble_start, int v_start, int lo, int hi, int bspan, "
+            "int L",
+            "int k = i / L; int local = i - k * L; int p = v_start + local; "
+            "if (p >= lo && p < hi) { "
+            "int j = p - assemble_start; int b = j / nvalid; int r = j - b * nvalid; "
+            "out[k * L + local] = "
+            "corr[k * bspan + b * nfft + bad_start + r] / rescale[k]; "
+            "} else { out[k * L + local] = pycuda::complex<float>(0.0f, 0.0f); }",
+            "fir_assemble_tiled")
+        _batched_assemble_kernel_cache[key] = krnl
+    return krnl
+
+
 _cufft_plan_cache = {}
 
 
@@ -177,6 +301,13 @@ class RatioMatchedFilterControl(object):
         # FFT backend: scipy.fft on CPU (mkl_fft-compatible interface).
         self.fft_lib = _ScipyFFTBackend(workers=fft_workers)
 
+        # Reusable on-device scratch buffer (K*n_blocks*N_FFT complex64) for the
+        # batched GPU path, grown on demand and reused across tiles / coarse
+        # groups so the per-tile multiply+ifft does not cudaMalloc/cudaFree
+        # (each free synchronises the device and starves it). See
+        # :meth:`fine_snr_timeseries_batch`.
+        self._gpu_scratch = None
+
     def prepare_filters(self, fir_taps, tap_counts):
         """
         Prepare frequency-domain filters for a batch of taps.
@@ -261,7 +392,19 @@ class RatioMatchedFilterControl(object):
             h_norm=h_norm
         )
         decimate = int(np.round(self.tap_sr / self.engine_sr))
-        self.ref_snr = snr.numpy() * (norm * stilde.delta_t) / decimate
+        scale = (norm * stilde.delta_t) / decimate
+        if _on_cuda():
+            # Keep the reference SNR ON THE DEVICE: ``matched_filter_core``
+            # returns ``snr`` as a device TimeSeries under CUDA, and the batched
+            # fine-template path builds its block FFTs from this device array via
+            # a gather kernel (see :meth:`_build_block_f_all`). This removes the
+            # device->host copy here AND the former host->device re-upload of the
+            # block-input buffer -- a full host round trip per (segment,
+            # detector, coarse reference). The CPU path is unchanged (host
+            # numpy, the parity reference).
+            self.ref_snr = snr * float(scale)
+        else:
+            self.ref_snr = snr.numpy() * scale
         # Block FFTs of ref_snr depend only on the reference SNR (not on the
         # fine template), so they are cached and reused across fine templates.
         self._block_fft_cache = {}
@@ -423,9 +566,6 @@ class RatioMatchedFilterControl(object):
         from skcuda import fft as cu_fft
         N_FFT = self.fir_fft_len
         n_samples = len(ref_snr)
-        n_taps_max = int(n_taps_eff)
-        N_VALID = N_FFT - n_taps_max + 1
-        bad_start = n_taps_max // 2  # filter support is -(n-1)//2 .. n//2 around the t=0 tap (n-1)//2, for odd AND even n
         if valid_slice is not None:
             v_start = valid_slice.start
             v_stop = valid_slice.stop
@@ -433,40 +573,15 @@ class RatioMatchedFilterControl(object):
             v_start = 0
             v_stop = n_samples
 
-        # Build (and cache) the batched forward FFT of all data blocks. The
-        # block grid (t_starts) tiles [v_start, v_stop) via overlap-save.
-        cached = block_cache.get('_gpu_batched')
-        if cached is None:
-            first_block_idx = (v_start - bad_start) // N_VALID
-            loop_start = max(0, first_block_idx * N_VALID)
-            t_starts = []
-            ts = loop_start
-            while ts < n_samples:
-                bvt0 = ts + bad_start
-                if bvt0 >= v_stop:
-                    break
-                if bvt0 + N_VALID > v_start:
-                    t_starts.append(ts)
-                ts += N_VALID
-            n_blocks = len(t_starts)
-            if n_blocks == 0:
-                # Degenerate/empty valid region: return zeros (matches the CPU
-                # path, whose block loop simply doesn't execute). Avoids a
-                # batch-0 cufft plan and the t_starts[0] dereference below.
-                return (zeros(n_samples, dtype=complex64) if return_device
-                        else np.zeros(n_samples, dtype=complex64))
-            block_in = np.zeros(n_blocks * N_FFT, dtype=np.complex64)
-            for b, ts in enumerate(t_starts):
-                te = min(ts + N_FFT, n_samples)
-                block_in[b * N_FFT: b * N_FFT + (te - ts)] = ref_snr[ts:te]
-            block_in_gpu = Array(block_in)
-            block_f_all = zeros(n_blocks * N_FFT, dtype=complex64)
-            plan = _get_cufft_plan(n_blocks, N_FFT)
-            cu_fft.fft(block_in_gpu.data, block_f_all.data, plan)
-            cached = (block_f_all, np.asarray(t_starts, dtype=np.int64),
-                      n_blocks, N_VALID, bad_start, plan)
-            block_cache['_gpu_batched'] = cached
-        block_f_all, t_starts, n_blocks, N_VALID, bad_start, plan = cached
+        # Build (and cache) the batched forward FFT of all data blocks (shared
+        # with the tiled path; reference SNR may be a device array or host numpy).
+        block_f_all, t_starts, n_blocks, N_VALID, bad_start, plan = \
+            self._build_block_f_all(ref_snr, n_taps_eff, valid_slice, block_cache)
+        if n_blocks == 0:
+            # Degenerate/empty valid region: return zeros (matches the CPU path,
+            # whose block loop simply doesn't execute).
+            return (zeros(n_samples, dtype=complex64) if return_device
+                    else np.zeros(n_samples, dtype=complex64))
 
         # Per fine template: broadcast analytic multiply, batched ifft.
         filt_gpu = Array(np.ascontiguousarray(filter_f, dtype=np.complex64))
@@ -498,6 +613,202 @@ class RatioMatchedFilterControl(object):
         if return_device:
             return out_gpu
         return out_gpu.numpy()
+
+    def _build_block_f_all(self, ref_snr, n_taps_eff, valid_slice, block_cache):
+        """Build (and cache, per ``block_cache``) the batched forward cufft of
+        the overlap-save data blocks of the reference SNR, ON THE DEVICE.
+
+        The block grid is fine-template independent (it depends only on the
+        reference SNR and ``n_taps_eff``), so it is computed once per
+        (segment, detector, coarse reference) and reused by every fine template
+        in the coarse group -- both the single-template and the tiled GPU paths.
+
+        ``ref_snr`` may be a device ``pycbc.types.Array``/``TimeSeries`` (the
+        driver path -- the reference SNR is kept on the device) or host numpy
+        (the unit tests). A host array is uploaded once; a device array is used
+        in place. The block-input buffer is gathered device->device by
+        :func:`_get_block_gather_kernel`, so there is no host round trip.
+
+        Returns the tuple cached under ``block_cache['_gpu_batched']``:
+        ``(block_f_all, t_starts, n_blocks, N_VALID, bad_start, plan)`` -- with
+        ``block_f_all is None`` and ``n_blocks == 0`` for a degenerate/empty
+        valid region.
+        """
+        from skcuda import fft as cu_fft
+        cached = block_cache.get('_gpu_batched')
+        if cached is not None:
+            return cached
+
+        N_FFT = self.fir_fft_len
+        n_samples = len(ref_snr)
+        n_taps_max = int(n_taps_eff)
+        N_VALID = N_FFT - n_taps_max + 1
+        # filter support is -(n-1)//2 .. n//2 around the t=0 tap (n-1)//2, for
+        # odd AND even n.
+        bad_start = n_taps_max // 2
+        if valid_slice is not None:
+            v_start = valid_slice.start
+            v_stop = valid_slice.stop
+        else:
+            v_start = 0
+            v_stop = n_samples
+
+        first_block_idx = (v_start - bad_start) // N_VALID
+        loop_start = max(0, first_block_idx * N_VALID)
+        t_starts = []
+        ts = loop_start
+        while ts < n_samples:
+            bvt0 = ts + bad_start
+            if bvt0 >= v_stop:
+                break
+            if bvt0 + N_VALID > v_start:
+                t_starts.append(ts)
+            ts += N_VALID
+        n_blocks = len(t_starts)
+        if n_blocks == 0:
+            cached = (None, np.asarray([], dtype=np.int64), 0,
+                      N_VALID, bad_start, None)
+            block_cache['_gpu_batched'] = cached
+            return cached
+
+        # Reference SNR on the device (upload host numpy once; use a device
+        # array in place). The blocks tile time contiguously with stride
+        # N_VALID from t_starts[0], so the gather base is t_starts[0].
+        if isinstance(ref_snr, np.ndarray):
+            ref_dev = Array(np.ascontiguousarray(ref_snr, dtype=np.complex64))
+        else:
+            ref_dev = ref_snr
+        block0 = int(t_starts[0])
+        block_in = zeros(n_blocks * N_FFT, dtype=complex64)
+        gk = _get_block_gather_kernel()
+        gk(ref_dev.data, block_in.data, np.int32(N_FFT), np.int32(N_VALID),
+           np.int32(block0), np.int32(n_samples),
+           range=slice(0, n_blocks * N_FFT, 1))
+        block_f_all = zeros(n_blocks * N_FFT, dtype=complex64)
+        plan = _get_cufft_plan(n_blocks, N_FFT)
+        cu_fft.fft(block_in.data, block_f_all.data, plan)
+        cached = (block_f_all, np.asarray(t_starts, dtype=np.int64),
+                  n_blocks, N_VALID, bad_start, plan)
+        block_cache['_gpu_batched'] = cached
+        return cached
+
+    def _get_gpu_scratch(self, n):
+        """Return a reusable device complex64 scratch buffer of at least ``n``
+        samples (grown on demand, never shrunk), used as the
+        multiply->in-place-ifft workspace for the tiled GPU path. Reusing it
+        across tiles/coarse groups avoids a per-tile cudaMalloc/cudaFree (each
+        free synchronises the device)."""
+        buf = self._gpu_scratch
+        if buf is None or len(buf) < n:
+            self._gpu_scratch = zeros(n, dtype=complex64)
+            buf = self._gpu_scratch
+        return buf
+
+    def fine_snr_timeseries_batch(self, filt_dev, k_tile, n_taps_eff,
+                                  valid_slice, ref_snr, block_cache,
+                                  rescales_dev, out_buffer):
+        """Reconstruct ``k_tile`` fine-template SNR series in ONE batched pass
+        (CUDA only) -- the throughput core of the FIR engine.
+
+        This is the tile generalisation of :meth:`_fine_snr_timeseries_cuda`:
+        instead of one (multiply -> ifft -> assemble) per fine template, it
+        stacks ``k_tile`` conjugated filters, broadcast-multiplies them against
+        the single cached forward FFT of the reference SNR in one kernel, runs
+        ONE batched inverse cufft over all ``k_tile * n_blocks`` transforms, and
+        assembles + fine-normalises all ``k_tile`` SNR series in one kernel --
+        turning thousands of tiny launch-bound kernel pairs into a handful of
+        large batched ops, so the GPU stays fed. The per-element math is
+        identical to the single-template kernel, so the result is bit-for-bit
+        the per-template result (same overlap-save grid, same 1/N inverse
+        normalisation, same gather).
+
+        Parameters
+        ----------
+        filt_dev : pycbc.types.Array
+            Device buffer of ``k_tile`` row-major length-``fir_fft_len``
+            conjugated FD filters (size ``k_tile * fir_fft_len``); a contiguous
+            slice of the coarse group's filters uploaded once.
+        k_tile : int
+            Number of filters in this tile.
+        n_taps_eff : int
+            Overlap-save tap count shared by the whole coarse group (the group
+            max), so every fine template shares the cached block grid.
+        valid_slice : slice
+            The analyze region; output rows are this slice's length ``L``.
+        ref_snr : pycbc.types.Array
+            Device reference SNR (built by :meth:`compute_reference_snr`).
+        block_cache : dict
+            Per-(segment, detector) cache holding the shared block FFT.
+        rescales_dev : pycbc.types.Array
+            Device float32 buffer of ``k_tile`` ``snr_rescale`` values; divided
+            out in the assemble kernel so each returned row is the fine-template
+            normalised complex SNR (matching the CPU ``series/snr_rescale``).
+        out_buffer : pycbc.types.Array
+            Device buffer of length ``>= k_tile * L`` that receives the
+            ``k_tile`` output rows; supplied (and reused across tiles/coarse
+            groups) by the caller so it is not reallocated per tile. The
+            assemble kernel writes every sample of every row (zero outside the
+            valid region), so no pre-zeroing is needed.
+
+        Returns
+        -------
+        list of pycbc.types.Array
+            ``k_tile`` length-``L`` device views into ``out_buffer`` (row ``ki``
+            is ``out_buffer[ki*L:(ki+1)*L]``), each the analyze-sliced,
+            fine-normalised complex SNR for that template. The caller thresholds
+            each on-device and pulls a row to the host only if a coincidence
+            needs it.
+        """
+        from skcuda import fft as cu_fft
+        N_FFT = self.fir_fft_len
+        n_samples = len(ref_snr)
+        if valid_slice is not None:
+            v_start = valid_slice.start
+            v_stop = valid_slice.stop
+        else:
+            v_start = 0
+            v_stop = n_samples
+        L = v_stop - v_start
+
+        block_f_all, t_starts, n_blocks, N_VALID, bad_start, plan = \
+            self._build_block_f_all(ref_snr, n_taps_eff, valid_slice,
+                                    block_cache)
+        if n_blocks == 0:
+            # Empty valid region: write zero rows (full-row assemble is skipped).
+            self._zero_rows(out_buffer, k_tile, L)
+            return [out_buffer[ki * L:(ki + 1) * L] for ki in range(k_tile)]
+
+        bspan = n_blocks * N_FFT
+        ntot = k_tile * bspan
+        scratch = self._get_gpu_scratch(ntot)
+
+        # 1) tiled half-spectrum multiply: scratch[k,b,:] = bf[b,:]*filt[k,:]/N
+        mk = _get_batched_mult_kernel()
+        mk(block_f_all.data, filt_dev.data, scratch.data,
+           np.int32(N_FFT), np.int32(N_FFT // 2 + 1), np.float32(1.0 / N_FFT),
+           np.int32(bspan), range=slice(0, ntot, 1))
+        # 2) ONE batched inverse cufft over all k_tile*n_blocks transforms,
+        #    in place in the scratch buffer.
+        iplan = _get_cufft_plan(k_tile * n_blocks, N_FFT)
+        cu_fft.ifft(scratch.data, scratch.data, iplan)
+        # 3) tiled assemble + fine-normalise into the caller's output buffer.
+        #    Writes every sample of every output row (zero outside [lo, hi)).
+        assemble_start = int(t_starts[0]) + bad_start
+        lo = max(v_start, assemble_start)
+        hi = min(v_stop, assemble_start + n_blocks * N_VALID, n_samples)
+        ak = _get_batched_assemble_kernel()
+        ak(scratch.data, out_buffer.data, rescales_dev.data,
+           np.int32(N_FFT), np.int32(N_VALID), np.int32(bad_start),
+           np.int32(assemble_start), np.int32(v_start), np.int32(lo),
+           np.int32(hi), np.int32(bspan), np.int32(L),
+           range=slice(0, k_tile * L, 1))
+        return [out_buffer[ki * L:(ki + 1) * L] for ki in range(k_tile)]
+
+    def _zero_rows(self, out_buffer, k_tile, L):
+        """Zero the first ``k_tile`` length-``L`` rows of ``out_buffer`` (used
+        only for the degenerate empty-valid-region case, where the assemble
+        kernel that would otherwise overwrite every row is skipped)."""
+        out_buffer[0:k_tile * L].fill(0)
 
     def _fft_all_filters(self, taps, counts):
         """Helper to FFT all filters using mkl_fft."""
