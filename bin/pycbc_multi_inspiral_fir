@@ -45,6 +45,7 @@ SNR therefore reduces to coherent SNR.
 """
 
 import logging
+import os
 import time
 import argparse
 import numpy as np
@@ -62,7 +63,9 @@ from pycbc import (
     DYN_RANGE_FAC,
     add_common_pycbc_options,
 )
-from pycbc.events import ranking, coherent as coh, EventManagerCoherent
+from pycbc.events import (
+    ranking, coherent as coh, threshold_only, EventManagerCoherent
+)
 from pycbc.filter.matched_ratio import RatioMatchedFilterControl
 from pycbc.types import zeros, float32, complex64, angle_as_radians
 from pycbc.waveform.bank import RatioFilterBank
@@ -244,6 +247,19 @@ strain_segments_dict = strain.StrainSegments.from_cli_multi_ifos(
 )
 
 ctx = scheme.from_cli(args)
+# On CUDA the per-detector SNR series stays on the device: the threshold runs
+# on-device (events.threshold_only -> sparse triggers only) and the full series
+# is pulled to the host lazily, once, only when a coincidence needs it for the
+# coherent combine. On CPU everything is host numpy (the parity reference).
+on_cuda = isinstance(ctx, scheme.CUDAScheme)
+# Escape hatch (perf A/B only, not for production): MIFIR_FORCE_HOST=1 forces
+# the legacy host path (per-template device->host SNR copy + host threshold)
+# even under CUDA, so the on-device optimization can be benchmarked against the
+# old behaviour on the same node/data. Results are identical either way.
+if on_cuda and os.environ.get("MIFIR_FORCE_HOST"):
+    logging.warning("MIFIR_FORCE_HOST set: using legacy host SNR path "
+                    "(benchmark mode; results unchanged, throughput lower).")
+    on_cuda = False
 with ctx:
     num_cpu_cores = 1
     if hasattr(ctx, "num_threads"):
@@ -368,8 +384,15 @@ with ctx:
     time_setup = time.time() - time_init
 
     logging.info("Starting the filtering...")
+    # Debug only (perf/correctness A-B), env-gated: stop after this many coarse
+    # groups so a bounded real-data comparison runs in minutes. 0/unset = full.
+    _max_coarse = int(os.environ.get("MIFIR_MAX_COARSE", "0"))
     # Loop over coarse references; reconstruct fine-template SNR from each.
     for c_num, coarse_idx in enumerate(bank.coarse_indices):
+        if _max_coarse and c_num >= _max_coarse:
+            logging.warning("MIFIR_MAX_COARSE=%d reached: stopping early "
+                            "(debug/benchmark mode).", _max_coarse)
+            break
         ref_template = bank.get_coarse_template(coarse_idx)
         taps, counts, fine_indices = bank.get_firs(coarse_idx)
         # FIR taps are detector-independent -> prepare the frequency-domain
@@ -443,7 +466,15 @@ with ctx:
                 if not analyse_segment:
                     continue
 
-                # Reconstruct per-detector complex SNR(t) for this fine template
+                # Reconstruct per-detector complex SNR(t) for this fine template.
+                # On CUDA the SNR series is kept ON THE DEVICE and thresholded
+                # on-device (events.threshold_only), so only the sparse triggers
+                # cross to the host -- the whole array no longer makes a
+                # device->host round trip per fine template. The full per-IFO
+                # series is retained (on device) so the coherent stage can
+                # rescue sub-threshold detectors at network candidate indices,
+                # matching brute pycbc_multi_inspiral; it is pulled to the host
+                # lazily, once, only if a coincidence actually needs it.
                 snr_dict = dict.fromkeys(args.instruments)
                 idx = dict.fromkeys(args.instruments)
                 snr = dict.fromkeys(args.instruments)
@@ -452,23 +483,42 @@ with ctx:
                     ref_arr, bcache, _ = ref_cache[(s_num, ifo)]
                     series = engines[ifo].fine_snr_timeseries(
                         filt, n_taps_group, stilde[ifo].analyze,
-                        ref_snr=ref_arr, block_cache=bcache
+                        ref_snr=ref_arr, block_cache=bcache,
+                        return_device=on_cuda
                     )
                     # Fine-template normalized complex SNR over the analyze slice
+                    # (a device Array under CUDA, host numpy on CPU).
                     snr_full = series[stilde[ifo].analyze] / snr_rescale
                     snr_dict[ifo] = snr_full
                     wraparound_dict[ifo] = len(snr_full)
                     assert wraparound_dict[ifo] > 0, \
                         f'SNR time series for {ifo} is empty'
-                    ind = np.flatnonzero(
-                        np.abs(snr_full) > args.sngl_snr_threshold
-                    ).astype(np.int32)
-                    idx[ifo] = ind
-                    snr[ifo] = snr_full[ind]
+                    if on_cuda:
+                        # On-device threshold: returns only the sparse
+                        # (locations, values) above threshold. snr_full already
+                        # carries the fine-template normalization, so the
+                        # returned values need no further rescaling -- matching
+                        # the host branch's snr_full[ind].
+                        locs, vals = threshold_only(
+                            snr_full, args.sngl_snr_threshold)
+                        idx[ifo] = locs.astype(np.int32)
+                        snr[ifo] = vals
+                    else:
+                        ind = np.flatnonzero(
+                            np.abs(snr_full) > args.sngl_snr_threshold
+                        ).astype(np.int32)
+                        idx[ifo] = ind
+                        snr[ifo] = snr_full[ind]
 
                 n_trigs = [len(snr[ifo]) for ifo in args.instruments]
                 if not any(n_trigs):
                     continue
+
+                # Under CUDA, snr_dict still holds on-device arrays. Materialize
+                # host copies lazily (once) the first time a coincidence needs
+                # the full per-detector series; templates with no coincidence
+                # never copy the (large) SNR series to the host at all.
+                snr_host_ready = not on_cuda
 
                 # ===========================================================
                 # Coherent statistic (unchanged from pycbc_multi_inspiral).
@@ -498,6 +548,17 @@ with ctx:
                             for ifo in args.instruments
                         }
                         if len(coinc_idx) != 0:
+                            if not snr_host_ready:
+                                # First coincidence for this (fine template,
+                                # segment): pull every detector's full SNR
+                                # series to the host once. The coherent combine
+                                # then runs on host arrays exactly as on CPU
+                                # (bit-identical), with no further device->host
+                                # copies; sub-threshold detectors are still
+                                # rescued because the full series is present.
+                                for _ifo in args.instruments:
+                                    snr_dict[_ifo] = snr_dict[_ifo].numpy()
+                                snr_host_ready = True
                             (rho_coinc, coinc_idx,
                              coinc_triggers) = coh.coincident_snr(
                                 snr_dict, coinc_idx, args.coinc_threshold,

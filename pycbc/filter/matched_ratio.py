@@ -52,6 +52,44 @@ def _get_analytic_mult_kernel():
     return krnl
 
 
+_assemble_kernel_cache = {}
+
+
+def _get_assemble_kernel():
+    """Return (memoised, per-context) a PyCUDA ElementwiseKernel that gathers
+    the overlap-save *valid* samples of every block into a contiguous device
+    SNR series -- the on-device equivalent of the CPU path's
+    ``ascontiguousarray(corr[:, bad_start:bad_start+N_VALID]).ravel()`` followed
+    by ``out[lo:hi] = valid_flat[...]``.
+
+    Launched over ``i in [0, hi-lo)`` (via ``range=slice(0, hi-lo, 1)``); each
+    output position ``p = i + lo`` maps back to a block ``b`` and a valid-region
+    offset ``r`` in the flat ``corr`` buffer of ``n_blocks`` stacked
+    length-``n_fft`` blocks:
+
+        j = p - assemble_start;  b = j / n_valid;  r = j % n_valid
+        out[p] = corr[b*n_fft + bad_start + r]
+
+    Writing only ``[lo, hi)`` leaves the rest of ``out`` (a preallocated zero
+    array) untouched, matching the CPU path which leaves samples outside the
+    valid region zero. Keeping this on the device removes the per-fine-template
+    device->host copy of the whole (overlap-padded) correlation buffer.
+    """
+    from pycuda.elementwise import ElementwiseKernel
+    key = id(pycbc.scheme.mgr.state)
+    krnl = _assemble_kernel_cache.get(key)
+    if krnl is None:
+        krnl = ElementwiseKernel(
+            "pycuda::complex<float> *corr, pycuda::complex<float> *out, "
+            "int n_fft, int n_valid, int bad_start, int assemble_start, int lo",
+            "int p = i + lo; int j = p - assemble_start; "
+            "int b = j / n_valid; int r = j - b * n_valid; "
+            "out[p] = corr[b * n_fft + bad_start + r]",
+            "fir_assemble_valid")
+        _assemble_kernel_cache[key] = krnl
+    return krnl
+
+
 _cufft_plan_cache = {}
 
 
@@ -245,7 +283,8 @@ class RatioMatchedFilterControl(object):
         return block_f
 
     def fine_snr_timeseries(self, filter_f, n_taps_eff, valid_slice,
-                            ref_snr=None, block_cache=None):
+                            ref_snr=None, block_cache=None,
+                            return_device=False):
         """Reconstruct the *full* complex SNR time series for a single fine
         template by ratio-filtering the cached reference SNR.
 
@@ -281,12 +320,21 @@ class RatioMatchedFilterControl(object):
             Defaults to ``self._block_fft_cache``. Pass a dedicated dict
             alongside ``ref_snr`` so the (fine-template-independent) block FFTs
             are reused across all fine templates sharing this reference SNR.
+        return_device : bool, optional
+            If True *and* the active scheme is CUDA, return the assembled SNR
+            series as an on-device ``pycbc.types.Array`` instead of host numpy
+            -- so the per-detector threshold and the coherent combine can run
+            on-device and only the (sparse) triggers cross to the host. Ignored
+            on the CPU path (which always returns host numpy, the parity
+            reference). Defaults to False (host numpy), preserving the original
+            behaviour for all existing callers (e.g. the CPU<->CUDA parity test).
 
         Returns
         -------
-        numpy.ndarray
+        numpy.ndarray or pycbc.types.Array
             Complex64 array of length ``len(ref_snr)`` holding the
-            reference-normalized fine-template SNR over ``valid_slice``.
+            reference-normalized fine-template SNR over ``valid_slice``. Host
+            numpy unless ``return_device`` selected the on-device CUDA return.
         """
         if ref_snr is None:
             ref_snr = self.ref_snr
@@ -295,7 +343,8 @@ class RatioMatchedFilterControl(object):
 
         if _on_cuda():
             return self._fine_snr_timeseries_cuda(
-                filter_f, n_taps_eff, valid_slice, ref_snr, block_cache)
+                filter_f, n_taps_eff, valid_slice, ref_snr, block_cache,
+                return_device=return_device)
 
         data = ref_snr
         n_samples = len(data)
@@ -346,13 +395,19 @@ class RatioMatchedFilterControl(object):
         return out
 
     def _fine_snr_timeseries_cuda(self, filter_f, n_taps_eff, valid_slice,
-                                  ref_snr, block_cache):
+                                  ref_snr, block_cache, return_device=False):
         """CUDA implementation of :meth:`fine_snr_timeseries`, batched on-device.
 
         Throughput-oriented GPU path. All overlap-save blocks are transformed
         in ONE batched forward cufft, the analytic multiply runs as a single
         broadcast ElementwiseKernel over all blocks, the inverse is ONE batched
-        cufft, and only a single device->host copy returns the assembled SNR.
+        cufft, and the valid samples are assembled into the output SNR series
+        ON THE DEVICE (a strided gather ElementwiseKernel). When
+        ``return_device`` is True the device array is returned directly -- no
+        per-fine-template device->host copy of the (overlap-padded) correlation
+        buffer -- so the caller can threshold and coherently combine on-device
+        and transfer only the sparse triggers. Otherwise the assembled series is
+        copied back to host (``.numpy()``), preserving the original behaviour.
         The batched forward FFT of the reference SNR (which is fine-template
         independent) is cached on the device in ``block_cache`` and reused
         across every fine template sharing this reference SNR -- so per fine
@@ -398,7 +453,8 @@ class RatioMatchedFilterControl(object):
                 # Degenerate/empty valid region: return zeros (matches the CPU
                 # path, whose block loop simply doesn't execute). Avoids a
                 # batch-0 cufft plan and the t_starts[0] dereference below.
-                return np.zeros(n_samples, dtype=complex64)
+                return (zeros(n_samples, dtype=complex64) if return_device
+                        else np.zeros(n_samples, dtype=complex64))
             block_in = np.zeros(n_blocks * N_FFT, dtype=np.complex64)
             for b, ts in enumerate(t_starts):
                 te = min(ts + N_FFT, n_samples)
@@ -420,18 +476,28 @@ class RatioMatchedFilterControl(object):
         krnl(block_f_all.data, filt_gpu.data, mult.data,
              np.int32(N_FFT), np.int32(N_FFT // 2 + 1), np.float32(1.0 / N_FFT))
         cu_fft.ifft(mult.data, corr.data, plan)
-        corr_host = corr.numpy().reshape(n_blocks, N_FFT)
 
-        # Assemble: each block contributes valid samples [bad_start, +N_VALID),
-        # which tile time contiguously from t_starts[0] + bad_start.
-        out = np.zeros(n_samples, dtype=complex64)
-        valid_flat = np.ascontiguousarray(
-            corr_host[:, bad_start:bad_start + N_VALID]).ravel()
+        # Assemble ON THE DEVICE: each block contributes valid samples
+        # [bad_start, +N_VALID), which tile time contiguously from
+        # t_starts[0] + bad_start. A strided gather ElementwiseKernel writes
+        # those into a length-n_samples device array (zeros elsewhere) -- the
+        # on-device equivalent of the former host
+        # ``ascontiguousarray(corr[:, bad_start:bad_start+N_VALID]).ravel()``
+        # + ``out[lo:hi] = valid_flat[...]``, with no per-template
+        # device->host copy of the (overlap-padded) correlation buffer.
         assemble_start = int(t_starts[0]) + bad_start
         lo = max(v_start, assemble_start)
         hi = min(v_stop, assemble_start + n_blocks * N_VALID, n_samples)
-        out[lo:hi] = valid_flat[lo - assemble_start: hi - assemble_start]
-        return out
+        out_gpu = zeros(n_samples, dtype=complex64)
+        if hi > lo:
+            asm = _get_assemble_kernel()
+            asm(corr.data, out_gpu.data,
+                np.int32(N_FFT), np.int32(N_VALID), np.int32(bad_start),
+                np.int32(assemble_start), np.int32(lo),
+                range=slice(0, hi - lo, 1))
+        if return_device:
+            return out_gpu
+        return out_gpu.numpy()
 
     def _fft_all_filters(self, taps, counts):
         """Helper to FFT all filters using mkl_fft."""
