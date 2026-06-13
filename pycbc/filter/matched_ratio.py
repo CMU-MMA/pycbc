@@ -268,6 +268,89 @@ class _ScipyFFTBackend(object):
             return out
         return r
 
+# ---------------------------------------------------------------------------
+# Parallel coarse-template generation (Phase 2).
+#
+# The coarse reference templates are generated on the CPU (TaylorF2/LAL), one
+# per coarse group, serially in the driver -- ~0.4 s each, during which the GPU
+# is idle. That fixed cost dominates once the per-fine-template GPU work is
+# batched. These two module-level helpers let the driver offload coarse
+# generation to a ProcessPool (spawned CPU workers, so they do NOT inherit the
+# parent's CUDA context) and overlap it with GPU filtering.
+#
+# A worker returns the coarse template's frequency-domain samples (host numpy)
+# plus the scalar attributes the driver needs to rebuild an identical
+# FrequencySeries on the device. For the CPU LAL approximants used here
+# (TaylorF2), the worker's CPU generation is bit-for-bit identical to the serial
+# path's generation, so results do not move (verified by the unit test
+# test_parallel_coarse_matches_serial).
+# ---------------------------------------------------------------------------
+_coarse_gen_bank = None
+
+
+def coarse_gen_init(bank_file, filter_length, delta_f, dtype_str,
+                    low_frequency_cutoff, phase_order, approximant):
+    """ProcessPool initializer: open one RatioFilterBank per worker.
+
+    Spawned workers start under the default (CPU) scheme with no CUDA context,
+    so the coarse template is generated on the CPU exactly as the serial driver
+    would (the driver also generates the CPU LAL approximant; only the device
+    upload differs, and that does not change the samples).
+    """
+    global _coarse_gen_bank
+    from pycbc.waveform.bank import RatioFilterBank
+    _coarse_gen_bank = RatioFilterBank(
+        bank_file, filter_length, delta_f, np.dtype(dtype_str),
+        low_frequency_cutoff=low_frequency_cutoff,
+        phase_order=phase_order, approximant=approximant)
+
+
+def coarse_gen_one(coarse_idx):
+    """Generate one coarse template in a worker; return (FD samples, attrs).
+
+    ``attrs`` carries exactly the scalar attributes that
+    ``FilterBank.__getitem__`` attaches and that ``compute_reference_snr`` (via
+    the cached ``sigmasq``) and ``matched_filter_core`` consume, so the driver
+    can rebuild an identical template on the device.
+    """
+    ht = _coarse_gen_bank.get_coarse_template(int(coarse_idx))
+    attrs = {
+        'f_lower': ht.f_lower,
+        'min_f_lower': getattr(ht, 'min_f_lower', None),
+        'end_idx': int(ht.end_idx),
+        'chirp_length': getattr(ht, 'chirp_length', None),
+        'length_in_time': getattr(ht, 'length_in_time', None),
+        'approximant': ht.approximant,
+        'end_frequency': ht.end_frequency,
+    }
+    return np.ascontiguousarray(ht.numpy(), dtype=np.complex64), attrs
+
+
+def coarse_reconstruct(fd, attrs, params, delta_f):
+    """Rebuild a coarse-template FrequencySeries from a worker's output.
+
+    Called in the driver (under the active scheme, so the array lands on the
+    device under CUDA). Reattaches the cached ``sigmasq`` method and every
+    attribute ``FilterBank.__getitem__`` sets, so the result is interchangeable
+    with ``bank.get_coarse_template(coarse_idx)``.
+    """
+    import types as _types
+    from pycbc.types import FrequencySeries
+    from pycbc.waveform.bank import sigma_cached
+    ht = FrequencySeries(fd, delta_f=delta_f, dtype=complex64)
+    ht.f_lower = attrs['f_lower']
+    ht.min_f_lower = attrs['min_f_lower']
+    ht.end_idx = attrs['end_idx']
+    ht.params = params
+    ht.chirp_length = attrs['chirp_length']
+    ht.length_in_time = attrs['length_in_time']
+    ht.approximant = attrs['approximant']
+    ht.end_frequency = attrs['end_frequency']
+    ht.sigmasq = _types.MethodType(sigma_cached, ht)
+    ht._sigmasq = {}
+    return ht
+
+
 class RatioMatchedFilterControl(object):
     """
     High-performance engine for hierarchical "Ratio/FIR" matched filtering.

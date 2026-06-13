@@ -383,6 +383,55 @@ class TestFIRvsBruteMatchedFilter(unittest.TestCase):
                         f"FIR SNR phase at the brute peak off by {phase_diff:.3f} rad")
 
 
+class TestParallelCoarseGen(unittest.TestCase):
+    """Phase 2: the parallel coarse-template generation (worker + reconstruct)
+    must reproduce the serial bank.get_coarse_template BIT-FOR-BIT, so results
+    do not move. CPU LAL generation is deterministic, so the worker's CPU
+    samples equal the serial path's; the test checks both the samples and the
+    cached sigmasq (the only coarse-template outputs the engine consumes)."""
+
+    def test_parallel_coarse_matches_serial(self):
+        import os
+        import numpy as np
+        from pycbc.types import FrequencySeries
+        from pycbc.waveform.bank import RatioFilterBank
+        from pycbc.filter.matched_ratio import (
+            coarse_gen_init, coarse_gen_one, coarse_reconstruct)
+        d = os.environ.get('MIFIR_DIR',
+                           '/hildafs/projects/phy220048p/xhall/scratch/mifir')
+        path = os.path.join(d, 'ratio_bank.hdf')
+        if not os.path.exists(path):
+            self.skipTest(f"no ratio bank at {path}")
+        flow = 45.0
+        sample_rate = 2048
+        tlen = 32768
+        delta_f = sample_rate / float(tlen)
+        flen = tlen // 2 + 1
+        bank = RatioFilterBank(path, flen, delta_f, np.complex64,
+                               low_frequency_cutoff=flow, phase_order='-1',
+                               approximant='TaylorF2')
+        psd = FrequencySeries(np.ones(flen, dtype=np.float32), delta_f=delta_f)
+        # Open a "worker" bank in-process (same call the ProcessPool uses).
+        coarse_gen_init(path, flen, delta_f, 'complex64', flow, '-1',
+                        'TaylorF2')
+        for cidx in [int(c) for c in bank.coarse_indices[:3]]:
+            serial = bank.get_coarse_template(cidx)
+            fd, attrs = coarse_gen_one(cidx)
+            recon = coarse_reconstruct(fd, attrs,
+                                       bank.coarse_bank.table[cidx], delta_f)
+            self.assertTrue(
+                np.array_equal(serial.numpy(), recon.numpy()),
+                f"coarse {cidx}: reconstructed samples differ from serial")
+            s_serial = float(serial.sigmasq(psd))
+            s_recon = float(recon.sigmasq(psd))
+            self.assertEqual(
+                s_serial, s_recon,
+                f"coarse {cidx}: reconstructed sigmasq {s_recon} != serial "
+                f"{s_serial}")
+            self.assertEqual(recon.f_lower, serial.f_lower)
+            self.assertEqual(recon.end_idx, serial.end_idx)
+
+
 class TestReferenceCutoffNormalization(unittest.TestCase):
     """Suite E: --high-frequency-cutoff consistency of the reference SNR.
 
@@ -488,6 +537,7 @@ if __name__ == '__main__':
     suite.addTest(loader.loadTestsFromTestCase(TestRatioEngineSNRSeries))
     suite.addTest(loader.loadTestsFromTestCase(TestEvenTapCentering))
     suite.addTest(loader.loadTestsFromTestCase(TestFIRvsBruteMatchedFilter))
+    suite.addTest(loader.loadTestsFromTestCase(TestParallelCoarseGen))
     suite.addTest(loader.loadTestsFromTestCase(TestReferenceCutoffNormalization))
     suite.addTest(loader.loadTestsFromTestCase(TestTapFidelity))
     results = unittest.TextTestRunner(verbosity=2).run(suite)

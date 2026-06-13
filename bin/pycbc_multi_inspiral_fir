@@ -66,7 +66,10 @@ from pycbc import (
 from pycbc.events import (
     ranking, coherent as coh, threshold_only, EventManagerCoherent
 )
-from pycbc.filter.matched_ratio import RatioMatchedFilterControl
+from pycbc.filter.matched_ratio import (
+    RatioMatchedFilterControl, coarse_gen_init, coarse_gen_one,
+    coarse_reconstruct,
+)
 from pycbc.types import zeros, float32, complex64, angle_as_radians, Array
 from pycbc.waveform.bank import RatioFilterBank
 from pycbc.tmpltbank.sky_grid import SkyGrid
@@ -191,6 +194,18 @@ fir_group.add_argument("--template-normalization-method",
 fir_group.add_argument("--fft-workers", type=int, default=None,
                        help="Number of threads for the CPU (scipy) batched "
                             "FFTs in the FIR engine.")
+fir_group.add_argument("--fir-coarse-workers", type=int, default=0,
+                       help="Generate coarse reference templates in this many "
+                            "background CPU worker processes (overlapped with "
+                            "GPU filtering), instead of serially in the main "
+                            "process. The CPU TaylorF2/LAL coarse generation "
+                            "(~0.4 s each) otherwise leaves the GPU idle and "
+                            "dominates once the per-fine-template work is "
+                            "batched. Workers are spawned (clean CPU processes, "
+                            "no CUDA context) and produce bit-identical "
+                            "templates. 0 (default) = serial generation in the "
+                            "main process. A good value is roughly the node's "
+                            "core count.")
 fir_group.add_argument("--fir-tile", type=int, default=32,
                        help="(CUDA only.) Number of fine templates whose SNR "
                             "time series are reconstructed in one batched GPU "
@@ -451,11 +466,13 @@ with ctx:
         out_pool = None
 
     def process_template(global_id, snr_rescale, sig_rescale, ref_cache,
-                         get_series):
+                         get_series, get_triggers):
         """Run the (unchanged) coherent statistic for one fine template across
         all segments. ``get_series(s_num, ifo)`` returns that detector's
         fine-normalised complex SNR series over the segment's analyze slice (a
-        device Array under CUDA, host numpy on CPU)."""
+        device Array under CUDA, host numpy on CPU); ``get_triggers(s_num, ifo,
+        snr_full)`` returns its above-threshold ``(time_indices, snr_values)``
+        (precomputed by the batched threshold on CUDA; computed here on CPU)."""
         template_params = bank.table[global_id]
         # Fine-template sigmasq per ifo from the coarse reference sigmasq.
         # new_template (and the stored per-template sigmasq) uses segment 0,
@@ -497,17 +514,9 @@ with ctx:
                 wraparound_dict[ifo] = len(snr_full)
                 assert wraparound_dict[ifo] > 0, \
                     f'SNR time series for {ifo} is empty'
-                if on_cuda:
-                    locs, vals = threshold_only(
-                        snr_full, args.sngl_snr_threshold)
-                    idx[ifo] = locs.astype(np.int32)
-                    snr[ifo] = vals
-                else:
-                    ind = np.flatnonzero(
-                        np.abs(snr_full) > args.sngl_snr_threshold
-                    ).astype(np.int32)
-                    idx[ifo] = ind
-                    snr[ifo] = snr_full[ind]
+                # On CUDA these were found by the batched threshold in the
+                # pre-pass (sparse, host); on CPU they are computed here.
+                idx[ifo], snr[ifo] = get_triggers(s_num, ifo, snr_full)
             _prof['threshold'] += time.time() - _t0
 
             n_trigs = [len(snr[ifo]) for ifo in args.instruments]
@@ -738,14 +747,52 @@ with ctx:
             _prof['cluster'] += time.time() - _t0
         event_mgr.finalize_template_events()
 
+    # --- Parallel coarse-template generation (Phase 2) -------------------
+    # Offload the CPU coarse-template generation to spawned worker processes
+    # (clean CPU, no CUDA context) and prefetch ahead of the main loop, so it
+    # overlaps with GPU filtering instead of stalling it serially. Workers
+    # produce bit-identical templates; results do not move.
+    coarse_list = [int(c) for c in bank.coarse_indices]
+    if _max_coarse:
+        coarse_list = coarse_list[:_max_coarse]
+        logging.warning("MIFIR_MAX_COARSE=%d: processing only the first %d "
+                        "coarse groups (debug/benchmark mode).",
+                        _max_coarse, len(coarse_list))
+    coarse_exec = None
+    coarse_futs = {}
+    if args.fir_coarse_workers and args.fir_coarse_workers > 0 and coarse_list:
+        import multiprocessing as _mp
+        from concurrent.futures import ProcessPoolExecutor
+        n_cw = min(args.fir_coarse_workers, len(coarse_list))
+        logging.info("Generating coarse templates in %d spawned CPU worker(s)",
+                     n_cw)
+        coarse_exec = ProcessPoolExecutor(
+            max_workers=n_cw, mp_context=_mp.get_context('spawn'),
+            initializer=coarse_gen_init,
+            initargs=(args.bank_file, flen, delta_f, 'complex64', flow,
+                      args.order, args.approximant))
+        _coarse_lookahead = 2 * n_cw
+        _coarse_next = 0
+
+        def _coarse_submit():
+            global _coarse_next
+            if _coarse_next < len(coarse_list):
+                coarse_futs[_coarse_next] = coarse_exec.submit(
+                    coarse_gen_one, coarse_list[_coarse_next])
+                _coarse_next += 1
+        for _ in range(min(_coarse_lookahead, len(coarse_list))):
+            _coarse_submit()
+
     # Loop over coarse references; reconstruct fine-template SNR from each.
-    for c_num, coarse_idx in enumerate(bank.coarse_indices):
-        if _max_coarse and c_num >= _max_coarse:
-            logging.warning("MIFIR_MAX_COARSE=%d reached: stopping early "
-                            "(debug/benchmark mode).", _max_coarse)
-            break
+    for c_num, coarse_idx in enumerate(coarse_list):
         _t0 = time.time()
-        ref_template = bank.get_coarse_template(coarse_idx)
+        if coarse_exec is not None:
+            fd, attrs = coarse_futs.pop(c_num).result()
+            _coarse_submit()   # keep the prefetch window full
+            ref_template = coarse_reconstruct(
+                fd, attrs, bank.coarse_bank.table[coarse_idx], delta_f)
+        else:
+            ref_template = bank.get_coarse_template(coarse_idx)
         _prof['coarse_gen'] += time.time() - _t0
         taps, counts, fine_indices = bank.get_firs(coarse_idx)
         # FIR taps are detector-independent -> prepare the FD filters once for
@@ -795,6 +842,7 @@ with ctx:
             k_tile = b - a
 
             tile_series = {}
+            tile_trig = {}
             if on_cuda:
                 _t0 = time.time()
                 filt_slice = filters_dev[a * N_FFT:b * N_FFT]
@@ -812,6 +860,37 @@ with ctx:
                     scheme.mgr.state.context.synchronize()
                 _prof['batch_snr'] += time.time() - _t0
 
+                # Batched threshold: ONE on-device threshold over all k_tile
+                # contiguous SNR rows per (segment, detector), instead of one
+                # threshold_only (each a device synchronise + host readback) per
+                # fine template -- the dominant per-template cost once the SNR
+                # reconstruction is batched. The flat crossing locations decode
+                # to (row=template, col=time): they come back sorted by flat
+                # index = row-major, so np.searchsorted splits them per template
+                # with within-row time order preserved (matching the per-template
+                # path's index-ordered output).
+                _t0 = time.time()
+                rowbins = np.arange(k_tile + 1)
+                for s_num in range(n_seg):
+                    Ls = (segments[args.instruments[0]][s_num].analyze.stop
+                          - segments[args.instruments[0]][s_num].analyze.start)
+                    for ifo in args.instruments:
+                        locs, vals = threshold_only(
+                            out_pool[(s_num, ifo)][0:k_tile * Ls],
+                            args.sngl_snr_threshold)
+                        if len(locs):
+                            rows_of = locs // Ls
+                            cols = (locs % Ls).astype(np.int32)
+                            bnd = np.searchsorted(rows_of, rowbins)
+                        else:
+                            cols = np.array([], dtype=np.int32)
+                            bnd = np.zeros(k_tile + 1, dtype=np.intp)
+                        for ki in range(k_tile):
+                            s0, s1 = bnd[ki], bnd[ki + 1]
+                            tile_trig[(ki, s_num, ifo)] = (cols[s0:s1],
+                                                           vals[s0:s1])
+                _prof['threshold'] += time.time() - _t0
+
             for ki in range(k_tile):
                 j = a + ki
                 global_id = int(fine_indices[j])
@@ -820,6 +899,9 @@ with ctx:
                 if on_cuda:
                     def get_series(s_num, ifo, _ki=ki):
                         return tile_series[(_ki, s_num, ifo)]
+
+                    def get_triggers(s_num, ifo, snr_full, _ki=ki):
+                        return tile_trig[(_ki, s_num, ifo)]
                 else:
                     def get_series(s_num, ifo, _j=j, _rescale=snr_rescale):
                         ref_arr, bcache, _ = ref_cache[(s_num, ifo)]
@@ -830,8 +912,16 @@ with ctx:
                             return_device=False)
                         return (series[segments[ifo][s_num].analyze]
                                 / _rescale)
+
+                    def get_triggers(s_num, ifo, snr_full):
+                        ind = np.flatnonzero(
+                            np.abs(snr_full) > args.sngl_snr_threshold
+                        ).astype(np.int32)
+                        return ind, snr_full[ind]
                 process_template(global_id, snr_rescale, sig_rescale,
-                                  ref_cache, get_series)
+                                  ref_cache, get_series, get_triggers)
+    if coarse_exec is not None:
+        coarse_exec.shutdown(wait=False, cancel_futures=True)
     logging.info("Filtering completed")
     _tot = sum(_prof.values()) or 1.0
     logging.info("PROFILE wall (s): " + ", ".join(
