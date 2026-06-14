@@ -103,6 +103,43 @@ def _ensure_threshold_buffers(nrequired):
     tl.gpudata = lptr
     threshold_buffer_size = nrequired
 
+
+# ---------------------------------------------------------------------------
+# Device-memory output buffers for threshold_only().
+#
+# The shared val/loc/n buffers above are device-MAPPED (zero-copy) pinned host
+# memory: every above-threshold crossing the kernel emits is an atomicAdd on the
+# counter plus a write, all served over PCIe from the GPU. That is fine when
+# crossings are rare, but a coherent FIR search thresholds tens of thousands of
+# long SNR series at a low single-detector threshold -> hundreds of millions of
+# crossings, and the serialized PCIe atomics dominate the run (~10 min).
+#
+# threshold_only() instead writes to ordinary DEVICE global memory (fast
+# in-GPU atomicAdd + coalesced-ish writes) and copies only the compacted result
+# (num crossings) back to the host in one bulk transfer. Same crossings, same
+# (sorted) output -- just without the per-crossing PCIe round trip.
+import pycuda.gpuarray as _gpuarray
+
+_dev_thr_cap = 0
+_dev_thr_count = None
+_dev_thr_val = None
+_dev_thr_loc = None
+
+
+def _ensure_dev_threshold_buffers(nrequired):
+    """Grow the DEVICE output buffers for threshold_only() to hold at least
+    ``nrequired`` crossings (the kernel has no bounds check, so they must be as
+    long as the input series)."""
+    global _dev_thr_cap, _dev_thr_count, _dev_thr_val, _dev_thr_loc
+    if _dev_thr_count is None:
+        _dev_thr_count = _gpuarray.zeros(1, numpy.uint32)
+    if nrequired <= _dev_thr_cap:
+        return
+    _dev_thr_val = _gpuarray.empty(int(nrequired), numpy.complex64)
+    _dev_thr_loc = _gpuarray.empty(int(nrequired), numpy.uint32)
+    _dev_thr_cap = int(nrequired)
+
+
 tkernel1 = mako.template.Template("""
 #include <stdio.h>
 
@@ -307,42 +344,39 @@ def threshold_only(series, value):
                 numpy.array([], dtype=numpy.complex64))
 
     # The kernel writes one entry per crossing with no bounds check, so the
-    # output buffers must be able to hold up to N entries.
-    _ensure_threshold_buffers(N)
+    # DEVICE output buffers must be able to hold up to N entries.
+    _ensure_dev_threshold_buffers(N)
 
-    # Zero the counter from the host *before* launch (see threshold_op).
-    n[0] = 0
+    # Zero the device counter before launch (see threshold_op).
+    _dev_thr_count.fill(numpy.uint32(0))
 
     # threshold_op compares abs(val) > threshold, i.e. sqrt(re^2+im^2) > value,
     # which is equivalent to the CPU's re^2 + im^2 > value^2 for value >= 0.
     threshold = numpy.float32(value)
 
-    # Iterate over exactly the N samples of the series; tv/tl/tn are the
-    # device-mapped output/counter shims (same objects used by
-    # threshold_and_cluster).
-    threshold_kernel(series.data, tv, tl, threshold, tn,
-                     range=slice(0, N, 1))
+    # Compact crossings into DEVICE memory (in-GPU atomicAdd + writes), not the
+    # zero-copy mapped buffers -- so there is no per-crossing PCIe round trip.
+    threshold_kernel(series.data, _dev_thr_val, _dev_thr_loc, threshold,
+                     _dev_thr_count, range=slice(0, N, 1))
 
-    # The counter and buffers are device-mapped host memory; synchronize before
-    # reading them back on the host.
     pycbc.scheme.mgr.state.context.synchronize()
 
-    num = int(n[0])
-    if num > threshold_buffer_size:
-        # Should be impossible given _ensure_threshold_buffers above, but never
-        # silently truncate: a saturated counter means the buffers overflowed.
+    num = int(_dev_thr_count.get()[0])
+    if num > _dev_thr_cap:
+        # Should be impossible given _ensure_dev_threshold_buffers above, but
+        # never silently truncate: a saturated counter means an overflow.
         raise RuntimeError(
             "threshold_only overflowed its output buffers: counted %d "
-            "crossings but buffers hold only %d" % (num, threshold_buffer_size))
+            "crossings but buffers hold only %d" % (num, _dev_thr_cap))
 
     if num == 0:
         return (numpy.array([], dtype=numpy.uint32),
                 numpy.array([], dtype=numpy.complex64))
 
-    # loc is allocated int32 but the locations must be returned as uint32.
-    # Copy out of the reused device-mapped buffers so the result is stable.
-    locations = loc[0:num].astype(numpy.uint32)
-    values = val[0:num].astype(numpy.complex64)
+    # Bulk device->host copy of ONLY the num compacted crossings (one transfer
+    # each), then return uint32 locations / complex64 values.
+    locations = _dev_thr_loc[0:num].get().astype(numpy.uint32)
+    values = _dev_thr_val[0:num].get().astype(numpy.complex64)
 
     # The kernel compacts crossings in atomicAdd order, which is
     # nondeterministic. Sort by location to match the CPU's index-ordered

@@ -41,6 +41,9 @@ echo "================ node: $(hostname)  date: $(date) ================"
 nvidia-smi -L || true
 rc=0
 
+echo ">> [$(date +%T)] threshold_cuda unit test (device-buffer threshold_only)"
+python3 test/test_threshold.py -s cuda || { echo "THRESHOLD UNIT TEST FAILED"; rc=1; }
+
 echo ">> [$(date +%T)] Gate A: CPU unit tests"
 python3 test/test_multi_inspiral_fir.py --scheme cpu || { echo "GATE A (cpu) FAILED"; rc=1; }
 
