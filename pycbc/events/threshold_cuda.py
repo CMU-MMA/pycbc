@@ -125,18 +125,88 @@ _dev_thr_count = None
 _dev_thr_val = None
 _dev_thr_loc = None
 
+# Internal wall-clock accounting for threshold_only(), summed across calls, so
+# the driver can attribute the threshold cost (env MIFIR_THR_PROFILE=1). Cheap
+# (a few perf_counter() calls per call); off by default.
+import os as _os
+import time as _time
+_thr_profile = bool(int(_os.environ.get("MIFIR_THR_PROFILE", "0")))
+threshold_only_prof = {'kernel': 0.0, 'copy': 0.0, 'sort': 0.0, 'calls': 0}
+
+# Ordered GPU stream-compaction for threshold_only (default ON; set
+# MIFIR_THR_SCAN=0 to fall back to the atomicAdd + host-argsort path).
+#
+# The atomicAdd path emits crossings in nondeterministic order and then sorts
+# them on the HOST (numpy radix argsort), which profiling showed dominates the
+# coherent FIR search (~85% of the threshold time). Instead, compact on the GPU
+# in INPUT-INDEX order via mask -> exclusive prefix sum -> scatter:
+#   mask[i]      = |series[i]| > thr ? 1 : 0
+#   pos          = exclusive_scan(mask)            (pos[i] = #crossings before i)
+#   if mask[i]:  out_loc[pos[i]] = i; out_val[pos[i]] = series[i]
+# The scatter writes each crossing at its prefix-sum position, so the output is
+# already sorted by location (= input index) -- bit-identical to the sorted
+# atomicAdd output, but with NO host sort, and the work stays on the GPU.
+_thr_scan_enabled = bool(int(_os.environ.get("MIFIR_THR_SCAN", "1")))
+
+_dev_thr_mask = None
+_dev_thr_pos = None
+
+_thr_mask_kernel_cache = {}
+_thr_scatter_kernel_cache = {}
+_thr_scan_cache = {}
+
+
+def _get_thr_mask_kernel():
+    key = id(pycbc.scheme.mgr.state)
+    k = _thr_mask_kernel_cache.get(key)
+    if k is None:
+        k = ElementwiseKernel(
+            "pycuda::complex<float> *in, unsigned int *mask, float thr",
+            "mask[i] = (abs(in[i]) > thr) ? 1u : 0u",
+            "thr_mask")
+        _thr_mask_kernel_cache[key] = k
+    return k
+
+
+def _get_thr_scatter_kernel():
+    key = id(pycbc.scheme.mgr.state)
+    k = _thr_scatter_kernel_cache.get(key)
+    if k is None:
+        k = ElementwiseKernel(
+            "pycuda::complex<float> *in, unsigned int *mask, unsigned int *pos, "
+            "pycuda::complex<float> *outv, unsigned int *outl",
+            "if (mask[i]) { outl[pos[i]] = i; outv[pos[i]] = in[i]; }",
+            "thr_scatter")
+        _thr_scatter_kernel_cache[key] = k
+    return k
+
+
+def _get_thr_scan():
+    from pycuda.scan import ExclusiveScanKernel
+    key = id(pycbc.scheme.mgr.state)
+    k = _thr_scan_cache.get(key)
+    if k is None:
+        k = ExclusiveScanKernel(numpy.uint32, "a+b", neutral="0")
+        _thr_scan_cache[key] = k
+    return k
+
 
 def _ensure_dev_threshold_buffers(nrequired):
     """Grow the DEVICE output buffers for threshold_only() to hold at least
     ``nrequired`` crossings (the kernel has no bounds check, so they must be as
     long as the input series)."""
     global _dev_thr_cap, _dev_thr_count, _dev_thr_val, _dev_thr_loc
+    global _dev_thr_mask, _dev_thr_pos
     if _dev_thr_count is None:
         _dev_thr_count = _gpuarray.zeros(1, numpy.uint32)
     if nrequired <= _dev_thr_cap:
         return
     _dev_thr_val = _gpuarray.empty(int(nrequired), numpy.complex64)
     _dev_thr_loc = _gpuarray.empty(int(nrequired), numpy.uint32)
+    if _thr_scan_enabled:
+        # mask (0/1 crossing flag) + its exclusive prefix sum (output position).
+        _dev_thr_mask = _gpuarray.empty(int(nrequired), numpy.uint32)
+        _dev_thr_pos = _gpuarray.empty(int(nrequired), numpy.uint32)
     _dev_thr_cap = int(nrequired)
 
 
@@ -322,6 +392,42 @@ def threshold_and_cluster(series, threshold, window):
     w = (cl != -1)
     return cv[w], cl[w]
 
+def _threshold_only_scan(series, threshold, N):
+    """Ordered GPU stream-compaction of the above-threshold samples (no host
+    sort). mask -> exclusive prefix sum -> scatter; the scatter writes each
+    crossing at its prefix-sum position, so the output is already sorted by
+    location (= input index), bit-identical to the sorted atomicAdd path."""
+    if _thr_profile:
+        _tk = _time.perf_counter()
+    mask = _dev_thr_mask[0:N]
+    pos = _dev_thr_pos[0:N]
+    _get_thr_mask_kernel()(series.data, mask, threshold, range=slice(0, N, 1))
+    _get_thr_scan()(mask, pos)   # exclusive prefix sum -> output positions
+    _get_thr_scatter_kernel()(series.data, mask, pos, _dev_thr_val,
+                              _dev_thr_loc, range=slice(0, N, 1))
+    pycbc.scheme.mgr.state.context.synchronize()
+    # total crossings = (exclusive sum up to N-1) + mask[N-1]
+    num = int(pos[N - 1:N].get()[0]) + int(mask[N - 1:N].get()[0])
+    if _thr_profile:
+        threshold_only_prof['kernel'] += _time.perf_counter() - _tk
+        threshold_only_prof['calls'] += 1
+    if num > _dev_thr_cap:
+        raise RuntimeError(
+            "threshold_only overflowed its output buffers: counted %d "
+            "crossings but buffers hold only %d" % (num, _dev_thr_cap))
+    if num == 0:
+        return (numpy.array([], dtype=numpy.uint32),
+                numpy.array([], dtype=numpy.complex64))
+    if _thr_profile:
+        _tc = _time.perf_counter()
+    # Already sorted by location -> no host argsort.
+    locations = _dev_thr_loc[0:num].get()
+    values = _dev_thr_val[0:num].get()
+    if _thr_profile:
+        threshold_only_prof['copy'] += _time.perf_counter() - _tc
+    return locations, values
+
+
 def threshold_only(series, value):
     """Return the locations and values of every sample of ``series`` whose
     magnitude exceeds ``value`` (i.e. real**2 + imag**2 > value**2), without
@@ -347,21 +453,31 @@ def threshold_only(series, value):
     # DEVICE output buffers must be able to hold up to N entries.
     _ensure_dev_threshold_buffers(N)
 
-    # Zero the device counter before launch (see threshold_op).
-    _dev_thr_count.fill(numpy.uint32(0))
-
     # threshold_op compares abs(val) > threshold, i.e. sqrt(re^2+im^2) > value,
     # which is equivalent to the CPU's re^2 + im^2 > value^2 for value >= 0.
     threshold = numpy.float32(value)
 
+    if _thr_scan_enabled:
+        # Ordered GPU compaction -> no host sort (see module header).
+        return _threshold_only_scan(series, threshold, N)
+
+    # ---- Fallback (MIFIR_THR_SCAN=0): atomicAdd compaction + host argsort ----
+    # Zero the device counter before launch (see threshold_op).
+    _dev_thr_count.fill(numpy.uint32(0))
+
     # Compact crossings into DEVICE memory (in-GPU atomicAdd + writes), not the
     # zero-copy mapped buffers -- so there is no per-crossing PCIe round trip.
+    if _thr_profile:
+        _tk = _time.perf_counter()
     threshold_kernel(series.data, _dev_thr_val, _dev_thr_loc, threshold,
                      _dev_thr_count, range=slice(0, N, 1))
 
     pycbc.scheme.mgr.state.context.synchronize()
 
     num = int(_dev_thr_count.get()[0])
+    if _thr_profile:
+        threshold_only_prof['kernel'] += _time.perf_counter() - _tk
+        threshold_only_prof['calls'] += 1
     if num > _dev_thr_cap:
         # Should be impossible given _ensure_dev_threshold_buffers above, but
         # never silently truncate: a saturated counter means an overflow.
@@ -374,15 +490,24 @@ def threshold_only(series, value):
                 numpy.array([], dtype=numpy.complex64))
 
     # Bulk device->host copy of ONLY the num compacted crossings (one transfer
-    # each), then return uint32 locations / complex64 values.
-    locations = _dev_thr_loc[0:num].get().astype(numpy.uint32)
-    values = _dev_thr_val[0:num].get().astype(numpy.complex64)
+    # each). The device buffers are already uint32 / complex64, so .get()
+    # returns the right dtypes directly (no redundant astype copy).
+    if _thr_profile:
+        _tc = _time.perf_counter()
+    locations = _dev_thr_loc[0:num].get()
+    values = _dev_thr_val[0:num].get()
+    if _thr_profile:
+        threshold_only_prof['copy'] += _time.perf_counter() - _tc
+        _ts = _time.perf_counter()
 
     # The kernel compacts crossings in atomicAdd order, which is
     # nondeterministic. Sort by location to match the CPU's index-ordered
     # output (threshold_cpu.threshold_only).
     order = numpy.argsort(locations, kind='stable')
-    return locations[order], values[order]
+    result = (locations[order], values[order])
+    if _thr_profile:
+        threshold_only_prof['sort'] += _time.perf_counter() - _ts
+    return result
 
 
 # As in threshold_cpu, threshold and threshold_only are the same operation.

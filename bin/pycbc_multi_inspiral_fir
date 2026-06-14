@@ -440,7 +440,8 @@ with ctx:
     # SNR setup, the batched fine-template SNR reconstruction, the per-template
     # threshold, the coherent stage, and clustering.
     _prof = {'coarse_gen': 0.0, 'ref_setup': 0.0, 'batch_snr': 0.0,
-             'threshold': 0.0, 'coherent': 0.0, 'cluster': 0.0}
+             'threshold': 0.0, 'thr_call': 0.0, 'thr_decode': 0.0,
+             'coherent': 0.0, 'cluster': 0.0}
     # The batched GPU SNR ops are queued asynchronously, so by default the
     # batch_snr timer captures only host queue time and the cost of executing
     # those kernels lands on the next synchronising stage (the per-template
@@ -449,20 +450,38 @@ with ctx:
     # profiling only -- leave unset for the throughput run).
     _profile_sync = bool(int(os.environ.get("MIFIR_PROFILE_SYNC", "0")))
 
-    # --- Batch tile sizing (CUDA) -----------------------------------------
+    # --- Batch tile sizing (CUDA), auto-tuned to the GPU ------------------
     # The GPU path reconstructs the fine-template SNR series for a TILE of K
     # templates in one pass (one big half-spectrum multiply + one batched ifft +
     # one assemble), so the GPU sees a handful of large kernels per coarse group
     # instead of tens of thousands of tiny, launch-bound ones. K is capped by
-    # GPU memory: per template we retain one analyze-length complex64 SNR row
-    # per (segment, detector) plus a shared per-detector multiply/ifft scratch
-    # (~1.1x analyze length).
+    # the *measured* free GPU memory so the same code adapts to the device
+    # (e.g. an A100-40/80 takes a large K; a V100-16/32 automatically takes a
+    # smaller one). Per template we retain, at the engine/analyze rate:
+    #   - one complex64 SNR row per (segment, detector)            -> out_pool
+    #   - a shared per-detector multiply/ifft scratch (~1.1x)      -> scratch
+    #   - the device threshold buffer (val complex64 + loc uint32) -> 12 B/sample
     if on_cuda:
         import pycuda.driver as _drv
+        dev = _drv.Context.get_device()
+        cc = dev.compute_capability()
         L_max = max(seg.analyze.stop - seg.analyze.start
                     for seg in segments[args.instruments[0]])
-        bytes_per_k = 8 * (n_seg * nifo * L_max + nifo * int(1.1 * L_max))
         free_b, total_b = _drv.mem_get_info()
+        logging.info("GPU: %s (compute %d.%d), %.1f GB free / %.1f GB total",
+                     dev.name(), cc[0], cc[1], free_b / 2**30, total_b / 2**30)
+        # Bytes of GPU memory that scale with K (per fine template in a tile):
+        # the device threshold buffers hold up to k_tile*L entries -- val
+        # (complex64, 8B) + loc (uint32, 4B), plus the scan path's mask + pos
+        # (uint32 each, 4B) = 20 B/sample (12 B without the ordered-compaction
+        # scan, MIFIR_THR_SCAN=0).
+        _thr_bytes = 20 if os.environ.get("MIFIR_THR_SCAN", "1") != "0" else 12
+        bytes_per_k = (n_seg * nifo * L_max * 8        # out_pool SNR rows
+                       + nifo * int(1.1 * L_max) * 8   # per-detector scratch
+                       + L_max * _thr_bytes)           # device threshold buffers
+        # Use at most half of free memory for the K-scaling buffers, leaving
+        # headroom for the cufft plan work areas, the cached block FFTs, the
+        # reference SNRs and the data segments.
         k_mem = max(1, int(free_b * 0.5) // bytes_per_k)
         TILE = max(1, min(args.fir_tile, k_mem))
         if TILE < args.fir_tile:
@@ -889,9 +908,12 @@ with ctx:
                     Ls = (segments[args.instruments[0]][s_num].analyze.stop
                           - segments[args.instruments[0]][s_num].analyze.start)
                     for ifo in args.instruments:
+                        _tt = time.time()
                         locs, vals = threshold_only(
                             out_pool[(s_num, ifo)][0:k_tile * Ls],
                             args.sngl_snr_threshold)
+                        _prof['thr_call'] += time.time() - _tt
+                        _td = time.time()
                         if len(locs):
                             rows_of = locs // Ls
                             cols = (locs % Ls).astype(np.int32)
@@ -903,6 +925,7 @@ with ctx:
                             s0, s1 = bnd[ki], bnd[ki + 1]
                             tile_trig[(ki, s_num, ifo)] = (cols[s0:s1],
                                                            vals[s0:s1])
+                        _prof['thr_decode'] += time.time() - _td
                 _prof['threshold'] += time.time() - _t0
 
             for ki in range(k_tile):
@@ -938,9 +961,20 @@ with ctx:
         coarse_pool.terminate()
         coarse_pool.join()
     logging.info("Filtering completed")
-    _tot = sum(_prof.values()) or 1.0
+    # thr_call/thr_decode are sub-components of threshold -> exclude from the
+    # total so the percentages sum to ~100%.
+    _subkeys = ('thr_call', 'thr_decode')
+    _tot = sum(v for k, v in _prof.items() if k not in _subkeys) or 1.0
     logging.info("PROFILE wall (s): " + ", ".join(
         "%s=%.1f(%.0f%%)" % (k, v, 100 * v / _tot) for k, v in _prof.items()))
+    if on_cuda:
+        try:
+            from pycbc.events import threshold_cuda as _tc
+            if _tc.threshold_only_prof.get('calls'):
+                logging.info("threshold_only internals (s): " + ", ".join(
+                    "%s=%s" % (k, v) for k, v in _tc.threshold_only_prof.items()))
+        except Exception:
+            pass
 
 time_stop = time.time()
 run_time = time_stop - time_init
